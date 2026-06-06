@@ -112,7 +112,7 @@ foreach ($gmod in $Script:GraphSubModules) {
 # CONFIGURACAO & INICIALIZACAO
 # ============================================================
 
-$Script:Version     = "4.1.0"
+$Script:Version     = "4.9.2"
 $Script:TenantName  = "Unknown"
 $Script:TenantId    = "Unknown"
 $Script:OutputPath  = $Script:OutputPath
@@ -334,7 +334,7 @@ function Show-Banner {
     Write-Host @"
 
   +===============================================================+
-  |              IR-O365  v4.1.0                                  |
+  |              IR-O365  v4.9.2                                  |
   |         MITRE ATT&CK Enterprise - Office Suite Mapped         |
   +===============================================================+
   |  Taticas: Initial Access | Persistence | Defense Evasion      |
@@ -385,341 +385,141 @@ function Test-Prerequisites {
 
 
 # ============================================================
-# AUTENTICACAO - Funcoes de suporte (fora de Connect-IRServices
-# para compatibilidade com PS5.1 StrictMode)
+# ============================================================
+# AUTENTICACAO - Modern Auth, sem reutilizacao de sessoes
+# Autentica no inicio, fecha no fim. Sem menus, sem estados.
 # ============================================================
 
-$Script:GraphScopes = @(
-    "AuditLog.Read.All", "Directory.Read.All", "Policy.Read.All",
-    "IdentityRiskyUser.Read.All", "SecurityEvents.Read.All",
-    "Application.Read.All", "RoleManagement.Read.Directory",
-    "IdentityRiskEvent.Read.All", "UserAuthenticationMethod.Read.All"
-)
-
-function Get-SessionState {
-    # Retorna hashtable com estado das sessoes activas
-    $state = @{
-        EXOConnected   = $false
-        EXOAccount     = ""
-        GraphConnected = $false
-        GraphAccount   = ""
-        GraphScopes    = @()
-    }
-    # EXO
-    try {
-        Get-OrganizationConfig -ErrorAction Stop | Out-Null
-        $state.EXOConnected = $true
-        try {
-            $conn = Get-ConnectionInformation -ErrorAction SilentlyContinue
-            if ($conn -and $conn.UserPrincipalName) {
-                $state.EXOAccount = $conn.UserPrincipalName
-            } else {
-                $state.EXOAccount = "sessao activa"
-            }
-        } catch { $state.EXOAccount = "sessao activa" }
-    } catch { }
-    # Graph
-    try {
-        $ctx = Get-MgContext -ErrorAction SilentlyContinue
-        if ($ctx -and $ctx.Account) {
-            $state.GraphConnected = $true
-            $state.GraphAccount   = $ctx.Account
-            $state.GraphScopes    = @($ctx.Scopes)
-        }
-    } catch { }
-    return $state
-}
-
-function Connect-EXO {
-    # Tenta ligar ao Exchange Online com fallback progressivo
-    # Retorna $true se conectado, $false caso contrario
-    Write-Host "  >> A conectar ao Exchange Online..." -ForegroundColor Gray
-
-    # Tentativa 1: OAuth interativo (PS7 / ambiente com WAM)
-    try {
-        Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop
-        Write-IRLog "Exchange Online: Conectado" -Severity "SUCCESS"
-        return $true
-    } catch {
-        $err = $_.Exception.Message
-        if ($err -notmatch "WithBroker|MissingMethodException|BrokerExtension|WAM") {
-            Write-IRLog "Exchange Online: $($err.Split([char]10)[0])" -Severity "HIGH"
-            return $false
-        }
-    }
-
-    # Broker WAM falhou - apresentar alternativas OAuth
-    Write-Host ""
-    Write-Host "  O broker WAM e incompativel com .NET 4.8 + PS5.1." -ForegroundColor Yellow
-    Write-Host "  Solucao permanente: instalar PS7" -ForegroundColor White
-    Write-Host "  winget install --id Microsoft.PowerShell" -ForegroundColor Green
-    Write-Host ""
-    Write-Host "  Metodos disponiveis:" -ForegroundColor White
-    Write-Host "  [1] Device Code OAuth  (browser em microsoft.com/devicelogin)" -ForegroundColor Cyan
-    Write-Host "  [2] App-Only + Cert    (App Registration no Entra, sem browser)" -ForegroundColor Cyan
-    Write-Host "  [3] Access Token       (token Bearer ja obtido externamente)" -ForegroundColor Cyan
-    Write-Host "  [4] Sem Exchange       (continuar apenas com modulos Graph)" -ForegroundColor Yellow
-    Write-Host "  [5] Sair" -ForegroundColor Gray
-    Write-Host ""
-
-    $opt = ""
-    while ($opt -notin @("1","2","3","4","5")) {
-        $opt = (Read-Host "  Opcao [1-5]").Trim()
-    }
-
-    switch ($opt) {
-        "1" {
-            Write-Host "  A verificar suporte a Device Code neste ambiente..." -ForegroundColor Gray
-            # Verificar se o parametro existe nesta versao do EXO
-            $hasDeviceParam = $null -ne (Get-Command Connect-ExchangeOnline -ErrorAction SilentlyContinue |
-                Select-Object -ExpandProperty Parameters -ErrorAction SilentlyContinue |
-                Where-Object { $_.Keys -contains "UseDeviceAuthentication" })
-
-            if (-not $hasDeviceParam) {
-                Write-IRLog "EXO v$((Get-Module ExchangeOnlineManagement).Version) nao suporta -UseDeviceAuthentication" -Severity "HIGH"
-                Write-Host ""
-                Write-Host "  Este metodo requer EXO v3.2.0+." -ForegroundColor Red
-                Write-Host "  A tua versao: $((Get-Module ExchangeOnlineManagement).Version)" -ForegroundColor Red
-                Write-Host "  Update-Module ExchangeOnlineManagement -Force" -ForegroundColor Yellow
-                Write-Host "  OU instala PS7 para resolver definitivamente." -ForegroundColor Green
-                return $false
-            }
-
-            Write-Host "  A aguardar autenticacao Device Code..." -ForegroundColor Gray
-            Write-Host "  Vai a: https://microsoft.com/devicelogin" -ForegroundColor Cyan
-            try {
-                Connect-ExchangeOnline -ShowBanner:$false -UseDeviceAuthentication -ErrorAction Stop
-                Write-IRLog "Exchange Online: Conectado via Device Code" -Severity "SUCCESS"
-                return $true
-            } catch {
-                $devErr = $_.Exception.Message
-                Write-IRLog "Device Code falhou: $($devErr.Split([char]10)[0])" -Severity "HIGH"
-                Write-Host "  Falhou. Tenta opcao [2] ou instala PS7." -ForegroundColor Red
-                return $false
-            }
-        }
-        "2" {
-            Write-Host "  Necessario: App Registration + Exchange.ManageAsApp + cert instalado" -ForegroundColor Gray
-            Write-Host "  Guia: https://aka.ms/exo-app-only-auth" -ForegroundColor DarkGray
-            Write-Host ""
-            $appId = (Read-Host "  App (Client) ID").Trim()
-            $org   = (Read-Host "  Organization (ex: contoso.onmicrosoft.com)").Trim()
-            $thumb = (Read-Host "  Certificate Thumbprint").Trim()
-            if (-not ($appId -and $org -and $thumb)) {
-                Write-Host "  Parametros incompletos." -ForegroundColor Red
-                return $false
-            }
-            try {
-                Connect-ExchangeOnline -AppId $appId -Organization $org `
-                    -CertificateThumbprint $thumb -ShowBanner:$false -ErrorAction Stop
-                Write-IRLog "Exchange Online: Conectado via App-Only OAuth" -Severity "SUCCESS"
-                return $true
-            } catch {
-                Write-IRLog "App-Only falhou: $($_.Exception.Message.Split([char]10)[0])" -Severity "HIGH"
-                return $false
-            }
-        }
-        "3" {
-            Write-Host "  Scope necessario: https://outlook.office365.com/.default" -ForegroundColor Gray
-            Write-Host "  Obter token: Get-MsalToken (modulo MSAL.PS) ou az account get-access-token" -ForegroundColor DarkGray
-            Write-Host ""
-            $token = (Read-Host "  Access Token Bearer").Trim()
-            if ($token.Length -lt 100) {
-                Write-Host "  Token invalido ou vazio." -ForegroundColor Red
-                return $false
-            }
-            try {
-                Connect-ExchangeOnline -AccessToken $token -ShowBanner:$false -ErrorAction Stop
-                Write-IRLog "Exchange Online: Conectado via Access Token" -Severity "SUCCESS"
-                return $true
-            } catch {
-                Write-IRLog "Access Token falhou: $($_.Exception.Message.Split([char]10)[0])" -Severity "HIGH"
-                return $false
-            }
-        }
-        "4" {
-            Write-IRLog "Exchange: ignorado pelo utilizador" -Severity "INFO"
-            return $false
-        }
-        "5" {
-            Write-Host "  A sair." -ForegroundColor Gray
-            exit 0
-        }
-    }
-    return $false
-}
-
-function Connect-Graph {
-    # Tenta ligar ao Microsoft Graph com fallback para Device Code
-    # Retorna $true se conectado, $false caso contrario
-    Write-Host "  >> A conectar ao Microsoft Graph..." -ForegroundColor Gray
-
-    # Tentativa 1: autenticacao interativa normal
-    try {
-        Connect-MgGraph -Scopes $Script:GraphScopes -ErrorAction Stop -NoWelcome
-        $ctx = Get-MgContext -ErrorAction SilentlyContinue
-        Write-IRLog "Microsoft Graph: Conectado como $($ctx.Account)" -Severity "SUCCESS"
-        return $true
-    } catch {
-        $err = $_.Exception.Message
-        Write-IRLog "Graph auth interativo falhou: $($err.Split([char]10)[0])" -Severity "INFO"
-    }
-
-    # Tentativa 2: Device Code
-    Write-Host "  Autenticacao interativa falhou - a tentar Device Code..." -ForegroundColor Gray
-    Write-Host "  Vai a: https://microsoft.com/devicelogin" -ForegroundColor Cyan
-    try {
-        Connect-MgGraph -Scopes $Script:GraphScopes -UseDeviceAuthentication -ErrorAction Stop -NoWelcome
-        $ctx = Get-MgContext -ErrorAction SilentlyContinue
-        Write-IRLog "Microsoft Graph: Conectado via Device Code como $($ctx.Account)" -Severity "SUCCESS"
-        return $true
-    } catch {
-        Write-IRLog "Graph Device Code falhou: $($_.Exception.Message.Split([char]10)[0])" -Severity "HIGH"
-    }
-
-    # Ambas falharam
-    Write-Host ""
-    Write-Host "  Nao foi possivel conectar ao Graph." -ForegroundColor Red
-    Write-Host "  [1] Tentar novamente" -ForegroundColor Cyan
-    Write-Host "  [2] Continuar sem Graph (apenas Exchange/UAL)" -ForegroundColor Yellow
-    Write-Host "  [3] Sair" -ForegroundColor Gray
-    $opt = ""
-    while ($opt -notin @("1","2","3")) { $opt = (Read-Host "  Opcao [1-3]").Trim() }
-    switch ($opt) {
-        "1"  { return Connect-Graph }
-        "2"  { $Script:SkipGraph = $true; return $false }
-        "3"  { exit 0 }
-    }
-    return $false
-}
-
 function Connect-IRServices {
-    Write-Section "CONECTAR A SERVICOS O365"
+    Write-Section "AUTENTICACAO O365"
 
-    # ---- Detectar sessoes activas ----
-    Write-Host "  >> A verificar sessoes activas..." -ForegroundColor Gray
-    $state = Get-SessionState
+    $graphScopes = @(
+        "AuditLog.Read.All","Directory.Read.All","Policy.Read.All",
+        "IdentityRiskyUser.Read.All","SecurityEvents.Read.All",
+        "Application.Read.All","RoleManagement.Read.Directory",
+        "IdentityRiskEvent.Read.All","UserAuthenticationMethod.Read.All",
+        "Reports.Read.All"
+    )
 
-    # ---- Apresentar estado ----
-    Write-Host ""
-    if ($state.EXOConnected) {
-        Write-Host "  [EXO]   Conectado  : $($state.EXOAccount)" -ForegroundColor Green
-    } else {
-        Write-Host "  [EXO]   Sem sessao activa" -ForegroundColor DarkGray
-    }
-    if ($state.GraphConnected) {
-        Write-Host "  [Graph] Conectado  : $($state.GraphAccount) ($($state.GraphScopes.Count) scopes)" -ForegroundColor Green
-    } else {
-        Write-Host "  [Graph] Sem sessao activa" -ForegroundColor DarkGray
-    }
+    # ---- Limpar sessoes anteriores ----
+    Write-Host "  >> A limpar sessoes anteriores..." -ForegroundColor Gray
+    try { Disconnect-MgGraph -ErrorAction SilentlyContinue } catch {}
+    try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+    $Script:EXOAvailable = $false
+    $Script:UALAvailable = $false
 
-    # ---- Menu dinamico ----
-    Write-Host ""
-    Write-Host "  Opcoes:" -ForegroundColor White
-
-    # Construir opcoes como array simples de strings para evitar hashtable + StrictMode
-    $menuLabels  = [System.Collections.Generic.List[string]]::new()
-    $menuActions = [System.Collections.Generic.List[string]]::new()
-
-    if ($state.EXOConnected -and $state.GraphConnected) {
-        $menuLabels.Add("Usar sessoes activas: EXO ($($state.EXOAccount)) + Graph ($($state.GraphAccount))")
-        $menuActions.Add("USE_BOTH")
-    }
-    if ($state.EXOConnected -and -not $state.GraphConnected) {
-        $menuLabels.Add("Usar EXO activo + autenticar Graph")
-        $menuActions.Add("USE_EXO_AUTH_GRAPH")
-        $menuLabels.Add("Usar apenas EXO (sem Graph)")
-        $menuActions.Add("USE_EXO_ONLY")
-    }
-    if ($state.GraphConnected -and -not $state.EXOConnected) {
-        $menuLabels.Add("Usar Graph activo + autenticar EXO")
-        $menuActions.Add("USE_GRAPH_AUTH_EXO")
-        $menuLabels.Add("Usar apenas Graph (sem Exchange)")
-        $menuActions.Add("USE_GRAPH_ONLY")
-    }
-    $menuLabels.Add("Nova autenticacao EXO + Graph")
-    $menuActions.Add("AUTH_BOTH")
-    $menuLabels.Add("Autenticar apenas Graph (sem Exchange)")
-    $menuActions.Add("AUTH_GRAPH_ONLY")
-    $menuLabels.Add("Sair")
-    $menuActions.Add("EXIT")
-
-    for ($i = 0; $i -lt $menuLabels.Count; $i++) {
-        $label  = $menuLabels[$i]
-        $action = $menuActions[$i]
-        $color  = switch -Wildcard ($action) {
-            "USE_BOTH"  { "Green"  }
-            "EXIT"      { "Gray"   }
-            "USE_*ONLY" { "Yellow" }
-            default     { "Cyan"   }
-        }
-        Write-Host "  [$($i+1)] $label" -ForegroundColor $color
-    }
+    # ---- Microsoft Graph (obrigatorio) ----
+    Write-Host "  >> A autenticar Microsoft Graph..." -ForegroundColor Gray
+    Write-Host "  Sera aberta uma janela de autenticacao no browser." -ForegroundColor DarkGray
     Write-Host ""
 
-    $max = $menuLabels.Count
-    $choice = ""
-    while ($choice -notmatch "^\d+$" -or [int]$choice -lt 1 -or [int]$choice -gt $max) {
-        $choice = (Read-Host "  Opcao [1-$max]").Trim()
-    }
-    $action = $menuActions[[int]$choice - 1]
+    $graphOk = $false
+    $attempt = 0
+    while (-not $graphOk -and $attempt -lt 3) {
+        $attempt++
+        try {
+            Connect-MgGraph -Scopes $graphScopes -NoWelcome -ErrorAction Stop
+            $ctx = Get-MgContext -ErrorAction SilentlyContinue
+            if ($ctx -and $ctx.Account) {
+                Write-IRLog "Microsoft Graph: Conectado como $($ctx.Account) (tenant: $($ctx.TenantId))" -Severity "SUCCESS"
+                $graphOk = $true
+            } else {
+                throw "Contexto Graph invalido apos autenticacao"
+            }
+        } catch {
+            $errMsg = $_.Exception.Message
+            Write-IRLog "Graph tentativa $attempt falhou: $($errMsg.Split([char]10)[0])" -Severity "HIGH"
 
-    # ---- Executar accao ----
-    switch ($action) {
-        "USE_BOTH" {
-            Write-IRLog "EXO: a usar sessao activa ($($state.EXOAccount))" -Severity "SUCCESS"
-            Write-IRLog "Graph: a usar sessao activa ($($state.GraphAccount))" -Severity "SUCCESS"
-            # Verificar scopes Graph
-            $needed  = @("AuditLog.Read.All","Directory.Read.All","Application.Read.All")
-            $missing = @($needed | Where-Object { $_ -notin $state.GraphScopes })
-            if ($missing.Count -gt 0) {
-                Write-IRLog "Graph: scopes em falta ($($missing -join ', ')) - alguns modulos podem falhar" -Severity "MEDIUM"
+            # Fallback: Device Code (nao precisa de browser embebido)
+            if ($attempt -eq 1) {
+                Write-Host "  Autenticacao interativa falhou. A tentar Device Code..." -ForegroundColor Yellow
+                Write-Host "  Vai a: https://microsoft.com/devicelogin" -ForegroundColor Cyan
+                try {
+                    Connect-MgGraph -Scopes $graphScopes -UseDeviceAuthentication -NoWelcome -ErrorAction Stop
+                    $ctx = Get-MgContext -ErrorAction SilentlyContinue
+                    if ($ctx -and $ctx.Account) {
+                        Write-IRLog "Microsoft Graph: Conectado via Device Code como $($ctx.Account)" -Severity "SUCCESS"
+                        $graphOk = $true
+                    }
+                } catch {
+                    Write-IRLog "Device Code falhou: $($_.Exception.Message.Split([char]10)[0])" -Severity "HIGH"
+                }
+            }
+
+            if (-not $graphOk -and $attempt -lt 3) {
+                Write-Host "  Tentar novamente? [s/n] " -NoNewline -ForegroundColor Yellow
+                $retry = (Read-Host).Trim().ToLower()
+                if ($retry -ne "s" -and $retry -ne "y") { break }
             }
         }
-        "USE_EXO_AUTH_GRAPH" {
-            Write-IRLog "EXO: a usar sessao activa ($($state.EXOAccount))" -Severity "SUCCESS"
-            if (-not (Connect-Graph)) { $Script:SkipGraph = $true }
-        }
-        "USE_EXO_ONLY" {
-            Write-IRLog "EXO: a usar sessao activa ($($state.EXOAccount))" -Severity "SUCCESS"
-            $Script:SkipGraph = $true
-            Write-IRLog "Graph: ignorado (opcao do utilizador)" -Severity "INFO"
-        }
-        "USE_GRAPH_AUTH_EXO" {
-            Write-IRLog "Graph: a usar sessao activa ($($state.GraphAccount))" -Severity "SUCCESS"
-            if (-not (Connect-EXO)) {
-                $Script:SkipExchange = $true
-                $Script:SkipUAL      = $true
-            }
-        }
-        "USE_GRAPH_ONLY" {
-            Write-IRLog "Graph: a usar sessao activa ($($state.GraphAccount))" -Severity "SUCCESS"
+    }
+
+    if (-not $graphOk) {
+        Write-Host ""
+        Write-Host "  Nao foi possivel autenticar no Microsoft Graph." -ForegroundColor Red
+        Write-Host "  O Graph e obrigatorio para a maioria dos modulos." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  [1] Continuar sem Graph (apenas Exchange se disponivel)" -ForegroundColor Yellow
+        Write-Host "  [2] Sair" -ForegroundColor Gray
+        $ans = ""
+        while ($ans -notin @("1","2")) { $ans = (Read-Host "  Opcao [1/2]").Trim() }
+        if ($ans -eq "2") { exit 0 }
+        $Script:SkipGraph = $true
+    }
+
+    # ---- Exchange Online (opcional - tenta, continua se falhar) ----
+    Write-Host ""
+    Write-Host "  >> A autenticar Exchange Online..." -ForegroundColor Gray
+
+    # Verificar se -UseDeviceAuthentication existe nesta build
+    $exoCmd          = Get-Command Connect-ExchangeOnline -ErrorAction SilentlyContinue
+    $hasDeviceParam  = $exoCmd -and $exoCmd.Parameters -and $exoCmd.Parameters.ContainsKey("UseDeviceAuthentication")
+
+    if ($hasDeviceParam) {
+        # EXO suporta Device Code - usar directamente (evita broker WAM)
+        Write-Host "  Vai a: https://microsoft.com/devicelogin" -ForegroundColor Cyan
+        try {
+            Connect-ExchangeOnline -ShowBanner:$false -UseDeviceAuthentication -ErrorAction Stop
+            Write-IRLog "Exchange Online: Conectado via Device Code" -Severity "SUCCESS"
+        } catch {
+            Write-IRLog "Exchange Online: Device Code falhou - $($_.Exception.Message.Split([char]10)[0])" -Severity "MEDIUM"
+            Write-Host "  EXO nao disponivel - modulos Exchange serao ignorados." -ForegroundColor Yellow
             $Script:SkipExchange = $true
             $Script:SkipUAL      = $true
-            Write-IRLog "Exchange: ignorado (opcao do utilizador)" -Severity "INFO"
         }
-        "AUTH_BOTH" {
-            if (-not (Connect-EXO)) {
-                $Script:SkipExchange = $true
-                $Script:SkipUAL      = $true
+    } else {
+        # EXO nao suporta Device Code nesta build - tentar interativo
+        Write-Host "  Nota: EXO v$((Get-Module ExchangeOnlineManagement -ErrorAction SilentlyContinue).Version) - a tentar autenticacao interativa..." -ForegroundColor DarkGray
+        try {
+            Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop
+            Write-IRLog "Exchange Online: Conectado" -Severity "SUCCESS"
+        } catch {
+            $err = $_.Exception.Message
+            if ($err -match "WithBroker|MissingMethodException|BrokerExtension") {
+                Write-IRLog "Exchange Online: Broker WAM incompativel (.NET 4.8 + PS5.1)" -Severity "MEDIUM"
+                Write-Host ""
+                Write-Host "  EXO nao disponivel neste ambiente." -ForegroundColor Yellow
+                Write-Host "  Para EXO: instalar PS7 (winget install --id Microsoft.PowerShell)" -ForegroundColor DarkGray
+                Write-Host "  A continuar com modulos Graph apenas." -ForegroundColor Gray
+            } else {
+                Write-IRLog "Exchange Online: $($err.Split([char]10)[0])" -Severity "MEDIUM"
             }
-            if (-not (Connect-Graph)) {
-                $Script:SkipGraph = $true
-            }
-        }
-        "AUTH_GRAPH_ONLY" {
             $Script:SkipExchange = $true
             $Script:SkipUAL      = $true
-            if (-not (Connect-Graph)) {
-                $Script:SkipGraph = $true
-            }
-        }
-        "EXIT" {
-            Write-Host "  A sair." -ForegroundColor Gray
-            exit 0
         }
     }
+
+    Write-Host ""
 }
+
+function Close-IRSessions {
+    # Chamada no fim do script - fechar todas as sessoes
+    Write-Host "  >> A fechar sessoes..." -ForegroundColor Gray
+    try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch {}
+    try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+    Write-IRLog "Sessoes terminadas" -Severity "INFO"
+}
+
 
 # ============================================================
 # MODULO 1: BASELINE DO TENANT
@@ -741,25 +541,7 @@ function Get-TenantBaseline {
         $Script:TenantId   = $org.Id
         Write-IRLog "Tenant: $($Script:TenantName) | ID: $($Script:TenantId)" -Severity "INFO"
 
-        # Renomear pasta de output para incluir nome do tenant (dentro de reports\)
-        if ($Script:TenantName) {
-            # Transliteracao para ASCII seguro no nome da pasta
-            $safeName = $Script:TenantName `
-                -replace '[\xE0-\xE5]','a' -replace '[\xE8-\xEB]','e' -replace '[\xEC-\xEF]','i' `
-                -replace '[\xF2-\xF6]','o' -replace '[\xF9-\xFC]','u' -replace '\xE7','c'          `
-                -replace '[\xC0-\xC5]','A' -replace '[\xC8-\xCB]','E' -replace '[\xCC-\xCF]','I' `
-                -replace '[\xD2-\xD6]','O' -replace '[\xD9-\xDC]','U' -replace '\xC7','C'          `
-                -replace '\s+','-'           -replace '[^a-zA-Z0-9\-\.]','' -replace '-{2,}','-'
-            $safeName   = $safeName.Trim('-').Trim('.')
-            $reportRoot = Split-Path $Script:OutputPath -Parent
-            $newFolder  = "IR-O365-$safeName-$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-            $newPath    = Join-Path $reportRoot $newFolder
-            if (-not (Test-Path $newPath)) {
-                $Script:OutputPath = $newPath
-                $OutputPath        = $newPath
-                New-OutputDirectory
-            }
-        }
+        # Pasta: .\ reports\IR-O365-YYYYMMDD_HHMMSS\ (sem rename por tenant)
         Export-IRData -FileName "00_tenant_baseline" -Data @($tenantInfo)
         
         # Verificar Security Defaults
@@ -1000,56 +782,104 @@ function Get-MFAStatus {
         )
         
         $adminsMFAResults = [System.Collections.Generic.List[PSObject]]::new()
-        
+
         foreach ($roleId in $privilegedRoles) {
             try {
-                # FIX: DirectoryRoleId lookup falha se role nao foi activada no tenant
-                # Tentar por template ID primeiro, fallback para listar todas as roles
                 $roleMembers = @()
                 try {
                     $roleMembers = @(Get-MgDirectoryRoleMember -DirectoryRoleId $roleId -ErrorAction Stop)
                 } catch {
-                    # Role pode nao existir se nunca foi activada - tentar via roleTemplateId
                     try {
                         $activeRole = Get-MgDirectoryRole -Filter "roleTemplateId eq '$roleId'" -ErrorAction SilentlyContinue
                         if ($activeRole) {
                             $roleMembers = @(Get-MgDirectoryRoleMember -DirectoryRoleId $activeRole.Id -ErrorAction SilentlyContinue)
                         }
                     } catch {
-                        Write-DebugError "PrivilegedIdentity" "Role lookup falhou para $roleId" $_
+                        Write-DebugError "MFAStatus" "Role lookup $roleId" $_
                     }
                 }
-                # FIX: garantir array mesmo quando Get-MgDirectoryRoleMember retorna objeto unico
                 if ($null -eq $roleMembers) { $roleMembers = @() }
                 $roleMembers = @($roleMembers)
+
                 foreach ($member in $roleMembers) {
-                    if ($member.AdditionalProperties["@odata.type"] -eq "#microsoft.graph.user") {
-                        $authMethods = @(Get-MgUserAuthenticationMethod -UserId $member.Id -ErrorAction SilentlyContinue)
-                        $hasMFA = $authMethods | Where-Object {
-                            $_.AdditionalProperties["@odata.type"] -in @(
-                                "#microsoft.graph.microsoftAuthenticatorAuthenticationMethod",
-                                "#microsoft.graph.phoneAuthenticationMethod",
-                                "#microsoft.graph.fido2AuthenticationMethod",
-                                "#microsoft.graph.windowsHelloForBusinessAuthenticationMethod"
-                            )
-                        }
-                        
-                        $record = [PSCustomObject]@{
-                            UserId         = $member.Id
-                            UPN            = $member.AdditionalProperties["userPrincipalName"]
-                            RoleId         = $roleId
-                            MFAConfigured  = if ($hasMFA) { $true } else { $false }
-                            MethodCount    = $authMethods.Count
-                        }
-                        $adminsMFAResults.Add($record)
-                        
-                        if (-not $hasMFA) {
-                            Write-IRLog "ADMIN SEM MFA: $($member.AdditionalProperties['userPrincipalName']) [T1556.006]" `
-                                -Severity "CRITICAL" -MITRETechnique "T1556.006" -MITRETactic "Defense Evasion" -Data $record
-                        }
+                    if ($member.AdditionalProperties["@odata.type"] -ne "#microsoft.graph.user") { continue }
+                    $uid = $member.Id
+                    $upn = $member.AdditionalProperties["userPrincipalName"]
+
+                    # --- Metodo 1: Get-MgUserAuthenticationMethod (requer UserAuthenticationMethod.Read.All)
+                    $hasMFA    = $false
+                    $mfaMethods= @()
+                    $methodSrc = "N/A"
+                    try {
+                        $authMethods = @(Get-MgUserAuthenticationMethod -UserId $uid -ErrorAction Stop)
+                        $mfaTypes = @(
+                            "#microsoft.graph.microsoftAuthenticatorAuthenticationMethod",
+                            "#microsoft.graph.phoneAuthenticationMethod",
+                            "#microsoft.graph.fido2AuthenticationMethod",
+                            "#microsoft.graph.windowsHelloForBusinessAuthenticationMethod",
+                            "#microsoft.graph.softwareOathAuthenticationMethod",
+                            "#microsoft.graph.temporaryAccessPassAuthenticationMethod"
+                        )
+                        $mfaMethods = @($authMethods | Where-Object {
+                            $_.AdditionalProperties["@odata.type"] -in $mfaTypes
+                        })
+                        $hasMFA    = $mfaMethods.Count -gt 0
+                        $methodSrc = "AuthenticationMethod API"
+                        Write-DebugError "MFAStatus" "User $upn - $($authMethods.Count) methods found, $($mfaMethods.Count) MFA" $null
+                    } catch {
+                        Write-DebugError "MFAStatus" "AuthMethod API falhou para $upn" $_
+                    }
+
+                    # --- Metodo 2 (fallback): verificar via User StrongAuthenticationRequirements (MSOL-style via Graph)
+                    if (-not $hasMFA -and $methodSrc -eq "N/A") {
+                        try {
+                            $userDetail = Get-MgUser -UserId $uid `
+                                -Property "Id,UserPrincipalName,StrongAuthenticationDetail" `
+                                -ErrorAction SilentlyContinue
+                            if ($userDetail -and $userDetail.AdditionalProperties.ContainsKey("strongAuthenticationDetail")) {
+                                $sad = $userDetail.AdditionalProperties["strongAuthenticationDetail"]
+                                if ($sad -and $sad.methods -and $sad.methods.Count -gt 0) {
+                                    $hasMFA    = $true
+                                    $methodSrc = "StrongAuthDetail"
+                                }
+                            }
+                        } catch { Write-DebugError "MFAStatus" "StrongAuth check $upn" $_ }
+                    }
+
+                    # --- Metodo 3 (fallback): verificar via Reports API - per-user MFA state
+                    if (-not $hasMFA -and $methodSrc -eq "N/A") {
+                        try {
+                            $regDetail = Get-MgReportAuthenticationMethodUserRegistrationDetail `
+                                -UserRegistrationDetailsId $uid -ErrorAction Stop
+                            if ($regDetail) {
+                                $hasMFA    = $regDetail.IsMfaRegistered -or $regDetail.IsMfaCapable
+                                $methodSrc = "RegistrationDetail (isMfaRegistered=$($regDetail.IsMfaRegistered))"
+                            }
+                        } catch { Write-DebugError "MFAStatus" "RegistrationDetail $upn" $_ }
+                    }
+
+                    $record = [PSCustomObject]@{
+                        UserId        = $uid
+                        UPN           = $upn
+                        RoleId        = $roleId
+                        MFAConfigured = $hasMFA
+                        MethodCount   = $mfaMethods.Count
+                        DetectionSrc  = $methodSrc
+                    }
+                    $adminsMFAResults.Add($record)
+
+                    if (-not $hasMFA -and $methodSrc -ne "N/A") {
+                        # So reportar como sem MFA se conseguimos verificar E nao tem
+                        Write-IRLog "ADMIN SEM MFA VERIFICADO: $upn (via $methodSrc) [T1556.006]" `
+                            -Severity "CRITICAL" -MITRETechnique "T1556.006" -MITRETactic "Defense Evasion" -Data $record
+                    } elseif ($methodSrc -eq "N/A") {
+                        Write-IRLog "MFA nao verificavel para $upn - scope UserAuthenticationMethod.Read.All pode estar em falta" `
+                            -Severity "INFO"
+                    } else {
+                        Write-IRLog "Admin com MFA: $upn ($methodSrc)" -Severity "INFO"
                     }
                 }
-            } catch { <# Role pode nao existir #> }
+            } catch { Write-DebugError "MFAStatus" "Role loop $roleId" $_ }
         }
         Export-IRData -FileName "02_admin_mfa_status" -Data $adminsMFAResults
         
@@ -1358,8 +1188,8 @@ function Get-ExchangeSuspiciousActivity {
 # ============================================================
 
 function Get-SuspiciousOAuthApps {
-    # T1550.001 - Application Access Token | T1671 - Cloud App Integration | T1528 - Steal App Access Token
-    Write-Section "OAUTH APPS & SERVICE PRINCIPALS" "T1550.001/T1528/T1671" "Persistence / Credential Access"
+    # T1550.001 - Application Access Token | T1098.003 - Cloud App Integration | T1528 - Steal App Access Token
+    Write-Section "OAUTH APPS & SERVICE PRINCIPALS" "T1550.001/T1528/T1098.003" "Persistence / Credential Access"
     
     try {
         # OAuth Consent Grants
@@ -1416,8 +1246,8 @@ function Get-SuspiciousOAuthApps {
             -ErrorAction SilentlyContinue)
         
         if ($recentSPs.Count -gt 0) {
-            Write-IRLog "Service Principals criados recentemente: $($recentSPs.Count) [T1671]" `
-                -Severity "MEDIUM" -MITRETechnique "T1671" -MITRETactic "Persistence"
+            Write-IRLog "Service Principals criados recentemente: $($recentSPs.Count) [T1098.003]" `
+                -Severity "MEDIUM" -MITRETechnique "T1098.003" -MITRETactic "Persistence"
             Export-IRData -FileName "05_recent_service_principals" -Data ($recentSPs | Select-Object DisplayName, AppId, CreatedDateTime, ServicePrincipalType, AppOwnerOrganizationId)
         }
         
@@ -1455,7 +1285,8 @@ function Get-SuspiciousOAuthApps {
         )
         
         $dangerousAssignments = [System.Collections.Generic.List[PSObject]]::new()
-        $sps = @(Get-MgServicePrincipal -All -Property "Id,DisplayName" -ErrorAction SilentlyContinue)
+        $reportedDangerPerms  = @{}
+        $sps = @(Get-MgServicePrincipal -All -Property "Id,DisplayName,AppId" -ErrorAction SilentlyContinue)
         
         $spTotal = $sps.Count
         $spIdx   = 0
@@ -1471,6 +1302,9 @@ function Get-SuspiciousOAuthApps {
                     if ($resource) {
                         $roleDef = $resource.AppRoles | Where-Object { $_.Id -eq $assignment.AppRoleId }
                         if ($roleDef -and $roleDef.Value -in $dangerousRoles) {
+                            $dedupKey = "$($sp.DisplayName)|$($roleDef.Value)"
+                            if ($reportedDangerPerms.ContainsKey($dedupKey)) { continue }
+                            $reportedDangerPerms[$dedupKey] = $true
                             $record = [PSCustomObject]@{
                                 ServicePrincipal = $sp.DisplayName
                                 Resource         = $resource.DisplayName
@@ -1497,7 +1331,7 @@ function Get-SuspiciousOAuthApps {
 # ============================================================
 
 function Get-CriticalAuditEvents {
-    # T1562.008 - Disable Cloud Logs | T1070.008 - Clear Mailbox | T1137 - Office App Startup
+    # T1562.008 - Disable Cloud Logs | T1070.004 - Clear Mailbox | T1137 - Office App Startup
     Write-Section "UNIFIED AUDIT LOG - EVENTOS CRITICOS" "T1562.008/T1070" "Defense Evasion"
     
     if ($Script:SkipUAL) { Write-IRLog "UAL skipped por parametro" -Severity "INFO"; return }
@@ -1522,13 +1356,13 @@ function Get-CriticalAuditEvents {
     
     $auditQueries = @(
         @{ Ops = @("Set-AdminAuditLogConfig","Disable-AdminAuditLogConfig");              Label = "Audit_Config_Changes";       MITRE = "T1562.008"; Sev = "CRITICAL" },
-        @{ Ops = @("New-ApplicationAccessPolicy","Remove-ApplicationAccessPolicy");       Label = "App_Access_Policy";          MITRE = "T1671";     Sev = "HIGH" },
+        @{ Ops = @("New-ApplicationAccessPolicy","Remove-ApplicationAccessPolicy");       Label = "App_Access_Policy";          MITRE = "T1098.003";     Sev = "HIGH" },
         @{ Ops = @("Add-MailboxPermission","Remove-MailboxPermission");                   Label = "Mailbox_Permission_Changes"; MITRE = "T1098.002"; Sev = "HIGH" },
         @{ Ops = @("Set-Mailbox");                                                        Label = "Mailbox_Config_Changes";     MITRE = "T1114.003"; Sev = "MEDIUM" },
         @{ Ops = @("New-TransportRule","Set-TransportRule","Remove-TransportRule");       Label = "Transport_Rule_Changes";     MITRE = "T1114.003"; Sev = "HIGH" },
         @{ Ops = @("Add-RoleGroupMember","New-RoleGroup");                               Label = "Exchange_Role_Changes";      MITRE = "T1098.003"; Sev = "HIGH" },
         @{ Ops = @("New-InboxRule","Set-InboxRule","Remove-InboxRule");                   Label = "Inbox_Rule_Operations";      MITRE = "T1564.008"; Sev = "HIGH" },
-        @{ Ops = @("HardDelete","SoftDelete");                                            Label = "Email_Hard_Deletions";       MITRE = "T1070.008"; Sev = "HIGH" },
+        @{ Ops = @("HardDelete","SoftDelete");                                            Label = "Email_Hard_Deletions";       MITRE = "T1070.004"; Sev = "HIGH" },
         @{ Ops = @("Update application","Add service principal credentials");             Label = "App_Credential_Updates";     MITRE = "T1528";     Sev = "HIGH" },
         @{ Ops = @("Add app role assignment to service principal");                       Label = "App_Role_Assignments";       MITRE = "T1550.001"; Sev = "HIGH" },
         @{ Ops = @("Consent to application","Add OAuth2PermissionGrant");                 Label = "OAuth_Consent_Events";       MITRE = "T1550.001"; Sev = "MEDIUM" },
@@ -1600,8 +1434,8 @@ function Get-SharePointActivity {
             -ErrorAction SilentlyContinue
         
         if ($anonShare.Count -gt 0) {
-            Write-IRLog "Partilhas Anonimas criadas: $($anonShare.Count) [T1567.004]" `
-                -Severity "HIGH" -MITRETechnique "T1567.004" -MITRETactic "Exfiltration"
+            Write-IRLog "Partilhas Anonimas criadas: $($anonShare.Count) [T1567.002]" `
+                -Severity "HIGH" -MITRETechnique "T1567.002" -MITRETactic "Exfiltration"
             Export-IRData -FileName "07_anonymous_shares" -Data ($anonShare | Select-Object CreationDate, UserIds, ObjectId, ClientIP)
         }
         
@@ -1628,8 +1462,8 @@ function Get-SharePointActivity {
             -ErrorAction SilentlyContinue
         
         if ($webhookEvents.Count -gt 0) {
-            Write-IRLog "Webhooks/Flows criados: $($webhookEvents.Count) [T1567.004 - Exfiltration over Webhook]" `
-                -Severity "HIGH" -MITRETechnique "T1567.004" -MITRETactic "Exfiltration"
+            Write-IRLog "Webhooks/Flows criados: $($webhookEvents.Count) [T1567.002 - Exfiltration over Webhook]" `
+                -Severity "HIGH" -MITRETechnique "T1567.002" -MITRETactic "Exfiltration"
             Export-IRData -FileName "07_webhook_flow_created" -Data ($webhookEvents | Select-Object CreationDate, UserIds, Operations, AuditData)
         }
         
@@ -1814,8 +1648,8 @@ function Get-TeamsSuspiciousActivity {
 # ============================================================
 
 function Get-ImpactIndicators {
-    # T1531 - Account Access Removal | T1657 - Financial Theft | T1667 - Email Bombing
-    Write-Section "INDICADORES DE IMPACTO" "T1531/T1657/T1667" "Impact"
+    # T1531 - Account Access Removal | T1657 - Financial Theft | T1531 - Email Bombing
+    Write-Section "INDICADORES DE IMPACTO" "T1531/T1657/T1531" "Impact"
     
     try {
         if (-not $Script:SkipUAL) {
@@ -1863,8 +1697,8 @@ function Get-ImpactIndicators {
                 Select-Object @{N="User";E={$_.Name}}, @{N="EmailsSent";E={$_.Count}}
             
             foreach ($hs in $highSenders) {
-                Write-IRLog "Possivel Email Bombing/BEC: $($hs.User) >> $($hs.EmailsSent) emails enviados [T1667]" `
-                    -Severity "HIGH" -MITRETechnique "T1667" -MITRETactic "Impact" -Data $hs
+                Write-IRLog "Possivel Email Bombing/BEC: $($hs.User) >> $($hs.EmailsSent) emails enviados [T1531]" `
+                    -Severity "HIGH" -MITRETechnique "T1531" -MITRETactic "Impact" -Data $hs
             }
         }
         
@@ -1876,8 +1710,8 @@ function Get-ImpactIndicators {
 # ============================================================
 
 function Get-DefenseEvasionIndicators {
-    # T1562.008 - Disable Cloud Logs | T1070.008 - Clear Mailbox | T1606 - SAML Tokens
-    Write-Section "DEFENSE EVASION" "T1562.008/T1070.008/T1550/T1606" "Defense Evasion"
+    # T1562.008 - Disable Cloud Logs | T1070.004 - Clear Mailbox | T1606 - SAML Tokens
+    Write-Section "DEFENSE EVASION" "T1562.008/T1070.004/T1550/T1606" "Defense Evasion"
     
     try {
         # SAML token anomalias (Golden SAML)
@@ -1929,8 +1763,8 @@ function Get-DefenseEvasionIndicators {
                 Select-Object @{N="User";E={$_.Name}}, @{N="DeletedItems";E={$_.Count}}
             
             foreach ($bd in $bulkDelete) {
-                Write-IRLog "Bulk Delete/Purge: $($bd.User) >> $($bd.DeletedItems) items eliminados [T1070.008]" `
-                    -Severity "HIGH" -MITRETechnique "T1070.008" -MITRETactic "Defense Evasion" -Data $bd
+                Write-IRLog "Bulk Delete/Purge: $($bd.User) >> $($bd.DeletedItems) items eliminados [T1070.004]" `
+                    -Severity "HIGH" -MITRETechnique "T1070.004" -MITRETactic "Defense Evasion" -Data $bd
             }
         }
         
@@ -1941,8 +1775,8 @@ function Get-DefenseEvasionIndicators {
                 $dkimConfig = Get-DkimSigningConfig -ErrorAction SilentlyContinue
                 $dkimDisabled = @($dkimConfig | Where-Object { $_.Enabled -eq $false })
                 if ($dkimDisabled.Count -gt 0) {
-                    Write-IRLog "DKIM desativado para dominios: $($dkimDisabled.Domain -join ', ') [T1672 - Email Spoofing]" `
-                        -Severity "MEDIUM" -MITRETechnique "T1672" -MITRETactic "Defense Evasion"
+                    Write-IRLog "DKIM desativado para dominios: $($dkimDisabled.Domain -join ', ') [T1566.002 - Email Spoofing]" `
+                        -Severity "MEDIUM" -MITRETechnique "T1566.002" -MITRETactic "Defense Evasion"
                     Export-IRData -FileName "12_dkim_disabled_domains" -Data $dkimDisabled
                 }
             } catch { Write-IRLog "Erro DKIM check: $_" -Severity "INFO" }
@@ -1965,417 +1799,566 @@ function New-HTMLReport {
     $totalFindings = $critCount + $highCount + $medCount + $lowCount
     $duration      = [math]::Round(((Get-Date) - $Script:StartTime).TotalMinutes, 1)
 
-    # Helper: encode HTML e truncar strings longas
-    function ConvertTo-SafeHtml ([string]$str, [int]$maxLen = 200) {
-        if (-not $str) { return "" }
-        $s = if ($str.Length -gt $maxLen) { $str.Substring(0, $maxLen) + "..." } else { $str }
-        return [System.Web.HttpUtility]::HtmlEncode($s)
+    function hx([string]$s,[int]$max=300) {
+        if (-not $s) { return "" }
+        $t = if ($s.Length -gt $max) { $s.Substring(0,$max)+"..." } else { $s }
+        return [System.Web.HttpUtility]::HtmlEncode($t)
     }
 
-    # Helper: converter $Data (hashtable/PSCustomObject) em tabela HTML de evidencias
-    function ConvertTo-EvidenceHtml ($data) {
+    function evHtmlFrom($data) {
         if ($null -eq $data) { return "" }
         $rows = ""
         try {
+            # Suporte a string simples
+            if ($data -is [string]) {
+                if ($data) { return "<div class='ev-str'>$(hx $data)</div>" }
+                return ""
+            }
+            # Suporte a array/lista
+            if ($data -is [System.Collections.IEnumerable] -and $data -isnot [string] -and $data -isnot [hashtable]) {
+                $arr = @($data)
+                if ($arr.Count -gt 0 -and $arr.Count -le 10) {
+                    foreach ($item in $arr) {
+                        $rows += "<tr><td colspan='2' class='ev'>$(hx ($item | Out-String).Trim())</td></tr>"
+                    }
+                }
+                if ($rows) { return "<table class='etbl'>$rows</table>" }
+                return ""
+            }
             $props = if ($data -is [hashtable]) {
                 $data.GetEnumerator() | Sort-Object Key
-            } elseif ($data -is [PSCustomObject]) {
-                $data.PSObject.Properties | Sort-Object Name
             } else {
-                # Escalar simples
-                return "<div class='ev-scalar'>$(ConvertTo-SafeHtml $data.ToString())</div>"
+                $data.PSObject.Properties | Sort-Object Name
             }
             foreach ($p in $props) {
-                $key = ConvertTo-SafeHtml $p.Name
-                $val = ConvertTo-SafeHtml ($p.Value | Out-String).Trim()
-                if ($val -and $val -ne "") {
-                    $rows += "<tr><td class='ev-key'>$key</td><td class='ev-val'>$val</td></tr>"
+                $v = ($p.Value | Out-String).Trim()
+                if ($v -and $v -ne "") {
+                    $rows += "<tr><td class='ek'>$(hx $p.Name)</td><td class='ev'>$(hx $v 400)</td></tr>"
                 }
             }
-        } catch { }
-        if ($rows) { return "<table class='ev-table'>$rows</table>" }
+        } catch {}
+        if ($rows) { return "<table class='etbl'>$rows</table>" }
         return ""
     }
 
-    # Construir linhas de findings com evidencias inline
+    # ---- Finding rows ----
     $findingRows = foreach ($f in $Script:Findings) {
-        $color = switch ($f.Severity) {
-            "CRITICAL" { "#ff4444" }
-            "HIGH"     { "#ff8c00" }
-            "MEDIUM"   { "#ffc107" }
-            "LOW"      { "#17a2b8" }
-            default    { "#6c757d" }
+        $sevClass = switch ($f.Severity) {
+            "CRITICAL" { "sc" } "HIGH" { "sh" } "MEDIUM" { "sm" } "LOW" { "sl" } default { "si" }
         }
-        $rowId        = "r$([guid]::NewGuid().ToString('N').Substring(0,8))"
-        $escapedMsg   = ConvertTo-SafeHtml $f.Message
-        $mitreLink    = if ($f.Technique) {
-            $techBase = $f.Technique.Split('/')[0]
-            "<a class='mitre-link' href='https://attack.mitre.org/techniques/$techBase' target='_blank'><code>$($f.Technique)</code></a>"
+        $rid   = "r$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        $emsg  = hx $f.Message
+        $mlink = if ($f.Technique) {
+            # MITRE URL format: T1562.008 -> /techniques/T1562/008/
+            $techUrl = $f.Technique.Split('/')[0] -replace '\.','/'
+            "<a class='ml' href='https://attack.mitre.org/techniques/$techUrl/' target='_blank'>$($f.Technique)</a>"
         } else { "" }
+        $ev    = evHtmlFrom $f.Data
+        $hasEv = $ev -ne ""
 
-        # Evidencias estruturadas
-        $evHtml = ConvertTo-EvidenceHtml $f.Data
-        $hasEvidence = $evHtml -ne ""
-
-        # CSV link - tentar inferir qual CSV corresponde
-        $csvLink = ""
-        if ($f.Technique) {
-            $csvFiles = @(Get-ChildItem -Path $Script:OutputPath -Filter "*.csv" -ErrorAction SilentlyContinue)
-            # Mapear tecnica para prefixo de ficheiro
-            $csvPrefix = switch -Wildcard ($f.Technique) {
-                "T1114*"  { "04_" }
-                "T1110*"  { "01_brute" }
-                "T1078*"  { "01_" }
-                "T1550*"  { "05_risky_oauth" }
-                "T1528*"  { "05_apps" }
-                "T1098*"  { "04_mailbox" }
-                "T1136*"  { "03_new" }
-                "T1562*"  { "06_ual_audit" }
-                "T1070*"  { "06_ual_email" }
-                "T1530*"  { "07_" }
-                "T1213*"  { "07_" }
-                default   { "" }
-            }
-            if ($csvPrefix) {
-                $match = $csvFiles | Where-Object { $_.Name.StartsWith($csvPrefix) } | Select-Object -First 1
-                if ($match) {
-                    $csvLink = "<a class='csv-link' href='$($match.Name)' title='Abrir evidencias CSV'>[CSV] $($match.Name)</a>"
-                }
-            }
+        $csvFiles = @(Get-ChildItem -Path $Script:OutputPath -Filter "*.csv" -ErrorAction SilentlyContinue)
+        $csvPfx = switch -Wildcard ($f.Technique) {
+            "T1114*" {"04_"} "T1110*" {"01_"} "T1078*" {"01_"} "T1550*" {"05_"} "T1528*" {"05_"}
+            "T1098*" {"04_"} "T1136*" {"03_"} "T1562*" {"06_"} "T1530*" {"07_"} default {""}
         }
-
-        $expandBtn = if ($hasEvidence) {
-            "<button class='expand-btn' onclick='toggleEvidence(`"$rowId`")'>+ evidencias</button>"
-        } else { "" }
+        $csvLnk = ""
+        if ($csvPfx) {
+            $cm = $csvFiles | Where-Object { $_.Name.StartsWith($csvPfx) } | Select-Object -First 1
+            if ($cm) { $csvLnk = "<a class='cl' href='$($cm.Name)'>CSV</a>" }
+        }
+        $evBtn  = if ($hasEv) { "<button class='eb' onclick='te(`"$rid`")''>+</button>" } else { "" }
+        $tact   = hx $f.Tactic
+        $ts     = if ($f.Timestamp.Length -ge 16) { $f.Timestamp.Substring(11,5) } else { $f.Timestamp }
 
         @"
-        <tr class='finding-row sev-$($f.Severity.ToLower())'>
-            <td><span class='badge' style='background:$color'>$($f.Severity)</span></td>
-            <td class='ts-col'>$($f.Timestamp)</td>
-            <td class='msg-col'>
-                $escapedMsg
-                <div class='finding-actions'>$expandBtn $csvLink</div>
-            </td>
-            <td>$mitreLink</td>
-            <td class='tactic-col'>$($f.Tactic)</td>
-        </tr>
-        $(if ($hasEvidence) {
-"        <tr id='$rowId' class='evidence-row' style='display:none'>
-            <td colspan='5' class='evidence-cell'>
-                <div class='evidence-header'>Evidencias recolhidas</div>
-                $evHtml
-            </td>
-        </tr>"
-        })
+<tr class='fr $sevClass' data-sev='$($f.Severity)' data-tac='$tact'>
+<td class='sc-cell'><span class='sp $sevClass'>$($f.Severity)</span></td>
+<td class='tc'>$ts</td>
+<td class='mc'><span class='mt'>$emsg</span><span class='ra'>$evBtn $csvLnk $mlink</span></td>
+<td class='tac'>$tact</td>
+</tr>
+$(if ($hasEv) { "<tr id='$rid' class='er' style='display:none'><td colspan='4'><div class='ed'>$ev</div></td></tr>" })
 "@
     }
     $findingsHTML = $findingRows -join ""
 
-    # Secao de threat summary por utilizador (pivot dos findings)
-    $userThreats = @{}
+    # ---- Pivot de findings CRITICAL/HIGH por entidade (user, app, dominio) ----
+    $entityMap = @{}
     foreach ($f in $Script:Findings) {
-        if ($f.Severity -in @("CRITICAL","HIGH")) {
-            $upnMatches = [regex]::Matches($f.Message, '[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
-            foreach ($m in $upnMatches) {
-                $upn = $m.Value
-                if (-not $userThreats.ContainsKey($upn)) { $userThreats[$upn] = @() }
-                $userThreats[$upn] += $f
+        if ($f.Severity -notin @("CRITICAL","HIGH")) { continue }
+
+        $entities = @()
+        # 1. UPNs / emails
+        [regex]::Matches($f.Message, '[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}') | ForEach-Object {
+            $entities += @{ Key = $_.Value; Type = "user" }
+        }
+        # 2. Nomes de apps entre aspas simples: 'AppName'
+        [regex]::Matches($f.Message, "'([^']{3,50})'") | ForEach-Object {
+            $entities += @{ Key = $_.Groups[1].Value; Type = "app" }
+        }
+        # 3. Dominios mencionados explicitamente
+        [regex]::Matches($f.Message, "dominio[s]?\s+([\w.\-]+)", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase) | ForEach-Object {
+            $entities += @{ Key = $_.Groups[1].Value; Type = "domain" }
+        }
+        # Fallback: se nenhuma entidade encontrada, usar primeiros 60 chars do finding
+        if ($entities.Count -eq 0) {
+            $shortMsg = if ($f.Message.Length -gt 60) { $f.Message.Substring(0,60) + "..." } else { $f.Message }
+            $entities += @{ Key = $shortMsg; Type = "finding" }
+        }
+        foreach ($e in $entities) {
+            $k = $e.Key
+            if (-not $entityMap.ContainsKey($k)) {
+                $entityMap[$k] = @{
+                    Type     = $e.Type
+                    Findings = [System.Collections.ArrayList]::new()
+                }
             }
+            [void]$entityMap[$k].Findings.Add($f)
         }
     }
 
-    $threatRows = ""
-    foreach ($upn in ($userThreats.Keys | Sort-Object)) {
-        $findings  = $userThreats[$upn]
-        $critC     = ($findings | Where-Object { $_.Severity -eq "CRITICAL" }).Count
-        $highC     = ($findings | Where-Object { $_.Severity -eq "HIGH" }).Count
-        $tactics   = ($findings.Tactic | Sort-Object -Unique) -join ", "
-        $techniques= ($findings.Technique | Where-Object { $_ } | Sort-Object -Unique) -join " "
-        $riskScore = ($critC * 10) + ($highC * 5)
-        $riskColor = if ($critC -gt 0) { "#ff4444" } elseif ($highC -gt 2) { "#ff8c00" } else { "#ffc107" }
-        $threatRows += @"
-        <tr>
-            <td><code style='color:#c9d1d9'>$([System.Web.HttpUtility]::HtmlEncode($upn))</code></td>
-            <td style='color:#ff4444;font-weight:700'>$critC</td>
-            <td style='color:#ff8c00;font-weight:700'>$highC</td>
-            <td><span style='background:$riskColor;color:#fff;padding:.2rem .5rem;border-radius:4px;font-size:.75rem'>$riskScore</span></td>
-            <td style='font-size:.8rem;color:#8b949e'>$([System.Web.HttpUtility]::HtmlEncode($tactics))</td>
-            <td style='font-size:.75rem'>$([System.Web.HttpUtility]::HtmlEncode($techniques))</td>
-        </tr>
-"@
+    $uRows = ""
+    foreach ($k in ($entityMap.Keys | Sort-Object)) {
+        $entry = $entityMap[$k]
+        $fs    = $entry.Findings
+        $cc    = @($fs | Where-Object { $_.Severity -eq "CRITICAL" }).Count
+        $hc    = @($fs | Where-Object { $_.Severity -eq "HIGH" }).Count
+        if ($cc -eq 0 -and $hc -eq 0) { continue }
+        $rs    = $cc*10 + $hc*5
+        $rsc   = if ($cc -gt 0) { "sc" } elseif ($hc -gt 2) { "sh" } else { "sm" }
+        $tacs  = ($fs.Tactic | Sort-Object -Unique) -join " &middot; "
+        $tecs  = ($fs.Technique | Where-Object {$_} | Sort-Object -Unique) -join " "
+        if     ($entry.Type -eq "user")   { $typeIcon = "&#128100;" }
+        elseif ($entry.Type -eq "app")    { $typeIcon = "&#128196;" }
+        elseif ($entry.Type -eq "domain") { $typeIcon = "&#127760;" }
+        else                              { $typeIcon = "&#9888;"   }
+        $uRows += "<tr><td class='upn'>$typeIcon $(hx $k)</td><td class='n sc'>$cc</td><td class='n sh'>$hc</td><td><span class='rs $rsc'>$rs</span></td><td class='sm-txt'>$tacs</td><td class='sm-txt mono'>$tecs</td></tr>"
     }
+    $usersSection = if ($uRows) {
+        "<table class='ut'><thead><tr><th>Entidade</th><th>CRIT</th><th>HIGH</th><th>Score</th><th>Taticas</th><th>Tecnicas</th></tr></thead><tbody>$uRows</tbody></table>"
+    } else { "<p class='empty'>Sem entidades com findings CRITICAL ou HIGH identificadas.</p>" }
 
-    $threatSummarySection = if ($threatRows) { @"
-<h2 style='margin:2rem 0 .5rem'>Utilizadores em Risco ($($userThreats.Count))</h2>
-<p style='color:#8b949e;font-size:.85rem;margin-bottom:1rem'>Utilizadores com findings CRITICAL ou HIGH - ordenados por UPN</p>
-<table>
-  <thead>
-    <tr>
-      <th>Utilizador</th>
-      <th>CRITICAL</th>
-      <th>HIGH</th>
-      <th>Risk Score</th>
-      <th>Taticas</th>
-      <th>Tecnicas</th>
-    </tr>
-  </thead>
-  <tbody>$threatRows</tbody>
-</table>
-"@ } else { "" }
-
-    # Secao de modulos executados (status de cada um)
-    $moduleStatus = @(
-        @{ Name = "Tenant Baseline";          CSV = "00_tenant_baseline.csv" },
-        @{ Name = "Sign-in Analysis";         CSV = "01_brute_force_by_ip.csv" },
-        @{ Name = "MFA / Conditional Access"; CSV = "02_admin_mfa_status.csv" },
-        @{ Name = "Privileged Accounts";      CSV = "03_role_changes.csv" },
-        @{ Name = "Exchange Rules";           CSV = "04_suspicious_inbox_rules.csv" },
-        @{ Name = "Mailbox Forwarding";       CSV = "04_mailbox_forwarding.csv" },
-        @{ Name = "OAuth / Service Principals";CSV = "05_risky_oauth_grants.csv" },
-        @{ Name = "Unified Audit Log";        CSV = "06_ual_audit_config_changes.csv" },
-        @{ Name = "SharePoint / OneDrive";    CSV = "07_anonymous_shares.csv" },
-        @{ Name = "Outlook Persistence";      CSV = "08_outlook_homepage.csv" },
-        @{ Name = "Defender Alerts";          CSV = "15_defender_alerts.csv" },
-        @{ Name = "Attack Timeline";          CSV = "21_attack_timeline.csv" }
+    # ---- Module status ----
+    $mods = @(
+        @{N="Tenant Baseline";         F="00_tenant_baseline.csv"},
+        @{N="Sign-in / Brute Force";   F="01_brute_force_by_ip.csv"},
+        @{N="MFA / Cond. Access";      F="02_admin_mfa_status.csv"},
+        @{N="Privileged Accounts";     F="03_role_changes.csv"},
+        @{N="Exchange Rules";          F="04_suspicious_inbox_rules.csv"},
+        @{N="Mailbox Forwarding";      F="04_mailbox_forwarding.csv"},
+        @{N="OAuth / Service Princ.";  F="05_risky_oauth_grants.csv"},
+        @{N="Unified Audit Log";       F="06_ual_audit_config_changes.csv"},
+        @{N="SharePoint / OneDrive";   F="07_anonymous_shares.csv"},
+        @{N="Outlook Persistence";     F="08_outlook_homepage.csv"},
+        @{N="Defender Alerts";         F="15_defender_alerts.csv"},
+        @{N="Privileged Identity";     F="17_privileged_identity_inventory.csv"},
+        @{N="Stale Devices";           F="20_stale_devices.csv"},
+        @{N="MFA Fatigue";             F="24_mfa_fatigue_suspects.csv"},
+        @{N="Impersonation";           F="25_impersonation_matches.csv"},
+        @{N="Enumeration";             F="26_enumeration_candidates.csv"},
+        @{N="Attack Timeline";         F="21_attack_timeline.csv"}
     )
-
-    $moduleRows = foreach ($mod in $moduleStatus) {
-        $csvPath = Join-Path $Script:OutputPath $mod.CSV
-        $exists  = Test-Path $csvPath
-        $lines   = if ($exists) { @(Get-Content $csvPath -ErrorAction SilentlyContinue).Count - 1 } else { -1 }
-        $status  = if (-not $exists)   { "<span style='color:#8b949e'>Nao executado</span>" }
-                   elseif ($lines -le 0){ "<span style='color:#ffc107'>Executado - 0 resultados</span>" }
-                   else                 { "<span style='color:#3fb950'>$lines registos</span>" }
-        $link    = if ($exists -and $lines -gt 0) { "<a class='csv-link' href='$($mod.CSV)'>[CSV] $($mod.CSV)</a>" } else { "" }
-        "<tr><td>$($mod.Name)</td><td>$status</td><td>$link</td></tr>"
+    $modCards = ""
+    foreach ($m in $mods) {
+        $cp  = Join-Path $Script:OutputPath $m.F
+        $ex  = Test-Path $cp
+        $cnt = if ($ex) { [math]::Max(0, (@(Get-Content $cp -ErrorAction SilentlyContinue).Count - 1)) } else { -1 }
+        if (-not $ex)     { $cls="ms"; $lbl="skipped" }
+        elseif ($cnt -le 0){ $cls="mw"; $lbl="0 resultados" }
+        else               { $cls="mo"; $lbl="$cnt registos" }
+        $lnk = if ($ex -and $cnt -gt 0) { " &middot; <a class='cl' href='$($m.F)'>CSV</a>" } else { "" }
+        $modCards += "<div class='mc2'><span class='md $cls'></span><span class='mn'>$([System.Web.HttpUtility]::HtmlEncode($m.N))</span><span class='ml2'>$lbl$lnk</span></div>"
     }
-    $moduleStatusHTML = $moduleRows -join ""
+
+    # ---- Build report path info ----
+    $graphAcc = try { (Get-MgContext -ErrorAction SilentlyContinue).Account } catch { "N/A" }
+    $exoSt    = if (Test-EXOAvailable) { "Conectado" } else { "Nao disponivel" }
+    $psVer    = "v$($PSVersionTable.PSVersion)"
 
     $html = @"
 <!DOCTYPE html>
 <html lang="pt">
 <head>
 <meta charset="UTF-8">
-<title>IR-O365 | $([System.Web.HttpUtility]::HtmlEncode($Script:TenantName)) | $(Get-Date -Format 'yyyy-MM-dd')</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IR-O365 | $(hx $Script:TenantName) | $(Get-Date -Format 'yyyy-MM-dd')</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
-  :root { --bg:#0d1117; --surface:#161b22; --border:#30363d; --text:#c9d1d9; --accent:#58a6ff; }
-  *  { margin:0; padding:0; box-sizing:border-box; }
-  body { background:var(--bg); color:var(--text); font-family:'Segoe UI',monospace; padding:2rem; max-width:1400px; margin:0 auto; }
-  h1  { color:var(--accent); font-size:1.8rem; margin-bottom:.4rem; }
-  h2  { color:var(--accent); font-size:1.15rem; }
-  .subtitle  { color:#8b949e; margin-bottom:.5rem; font-size:.85rem; }
-  .tenant-badge { display:inline-block; background:#21262d; border:1px solid #30363d; border-radius:6px;
-                  padding:.3rem .8rem; font-size:.8rem; color:#8b949e; margin-bottom:1.5rem; font-family:monospace; }
-  /* Stats */
-  .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:1rem; margin-bottom:2rem; }
-  .stat-card { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:1.2rem; text-align:center; }
-  .stat-card .num { font-size:2.5rem; font-weight:700; }
-  .stat-card .label { font-size:.8rem; color:#8b949e; margin-top:.3rem; }
-  .critical .num { color:#ff4444; } .high .num { color:#ff8c00; }
-  .medium .num   { color:#ffc107; } .low .num  { color:#17a2b8; }
-  /* Meta cards */
-  .meta { display:grid; grid-template-columns:1fr 1fr; gap:1rem; margin-bottom:2rem; }
-  .meta-card { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:1rem; }
-  .meta-card h3 { font-size:.9rem; color:var(--accent); margin-bottom:.5rem; }
-  .meta-card p  { font-size:.82rem; color:#8b949e; line-height:1.8; }
-  /* Tables */
-  table { width:100%; border-collapse:collapse; background:var(--surface); border-radius:8px; overflow:hidden; margin-top:.5rem; }
-  thead { background:#21262d; }
-  th  { padding:.75rem 1rem; text-align:left; font-size:.82rem; color:#8b949e; border-bottom:1px solid var(--border); }
-  td  { padding:.65rem 1rem; font-size:.83rem; border-bottom:1px solid #21262d; vertical-align:top; }
-  tr.finding-row:hover > td { background:#1c2128; }
-  /* Severity row accent */
-  tr.sev-critical td:first-child { border-left:3px solid #ff4444; }
-  tr.sev-high     td:first-child { border-left:3px solid #ff8c00; }
-  tr.sev-medium   td:first-child { border-left:3px solid #ffc107; }
-  tr.sev-low      td:first-child { border-left:3px solid #17a2b8; }
-  /* Badge */
-  .badge { padding:.2rem .55rem; border-radius:4px; font-size:.73rem; font-weight:600; color:#fff; white-space:nowrap; }
-  code { background:#21262d; padding:.1rem .4rem; border-radius:3px; font-size:.78rem; color:#79c0ff; }
-  /* Column widths */
-  .ts-col     { white-space:nowrap; color:#8b949e; font-size:.78rem; width:130px; }
-  .msg-col    { max-width:500px; }
-  .tactic-col { white-space:nowrap; font-size:.78rem; color:#8b949e; }
-  /* Finding actions */
-  .finding-actions { margin-top:.4rem; display:flex; gap:.6rem; flex-wrap:wrap; }
-  /* Expand button */
-  .expand-btn { background:none; border:1px solid #30363d; color:#58a6ff; border-radius:4px;
-                padding:.15rem .5rem; font-size:.73rem; cursor:pointer; font-family:inherit; }
-  .expand-btn:hover { background:#21262d; }
-  /* Evidence row */
-  .evidence-row td { background:#0d1117; padding:0; }
-  .evidence-cell { padding:.8rem 1rem 1rem 2rem !important; }
-  .evidence-header { font-size:.75rem; color:#8b949e; text-transform:uppercase; letter-spacing:.05em;
-                     margin-bottom:.5rem; border-bottom:1px solid #21262d; padding-bottom:.3rem; }
-  /* Evidence table */
-  .ev-table { width:auto; min-width:400px; max-width:900px; border-radius:6px; font-size:.8rem; margin:0; }
-  .ev-table tr:last-child td { border-bottom:none; }
-  .ev-key { color:#8b949e; width:180px; padding:.35rem .7rem; white-space:nowrap; }
-  .ev-val { color:#c9d1d9; padding:.35rem .7rem; word-break:break-all; font-family:monospace; }
-  .ev-scalar { color:#c9d1d9; font-family:monospace; font-size:.8rem; }
-  /* CSV link */
-  .csv-link { color:#3fb950; font-size:.75rem; text-decoration:none; }
-  .csv-link:hover { text-decoration:underline; }
-  /* MITRE link */
-  .mitre-link { color:#79c0ff; text-decoration:none; font-size:.78rem; }
-  .mitre-link:hover { text-decoration:underline; }
-  /* Filter bar */
-  .filter-bar { display:flex; gap:.5rem; margin-bottom:.75rem; flex-wrap:wrap; align-items:center; }
-  .filter-btn { background:#21262d; border:1px solid #30363d; color:#c9d1d9; border-radius:6px;
-                padding:.3rem .8rem; font-size:.8rem; cursor:pointer; font-family:inherit; }
-  .filter-btn.active { border-color:#58a6ff; color:#58a6ff; }
-  .filter-btn:hover { background:#2d333b; }
-  .search-box { background:#21262d; border:1px solid #30363d; color:#c9d1d9; border-radius:6px;
-                padding:.3rem .7rem; font-size:.8rem; font-family:inherit; width:240px; }
-  .search-box:focus { outline:none; border-color:#58a6ff; }
-  /* Footer */
-  .footer { margin-top:1.5rem; font-size:.75rem; color:#8b949e; }
-  /* Section divider */
-  .section-divider { border:none; border-top:1px solid #21262d; margin:2rem 0; }
+:root{
+  --bg:#080b10;--s1:#0d1117;--s2:#131820;--s3:#1a2233;--s4:#212d42;
+  --b1:#1e2a3d;--b2:#253347;--b3:#2d3f5a;
+  --tx:#dce4f0;--t2:#8899b0;--t3:#4a5a72;--t4:#2e3e55;
+  --red:#ff5f5f;--red-d:#1a0808;--red-b:#3d1212;
+  --ora:#ff8c42;--ora-d:#1a0e05;--ora-b:#3d2010;
+  --yel:#f5c842;--yel-d:#1a1500;--yel-b:#3d3200;
+  --blu:#4d9fff;--blu-d:#060e1a;--blu-b:#0e2040;
+  --grn:#3dd68c;--grn-d:#04160c;
+  --teal:#26d0ce;--pur:#9d7dff;
+  --mono:'JetBrains Mono',monospace;
+  --sans:'Inter',system-ui,sans-serif;
+  --r:5px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth;font-size:14px}
+body{background:var(--bg);color:var(--tx);font-family:var(--sans);line-height:1.6;min-height:100vh}
+a{color:var(--teal);text-decoration:none}a:hover{text-decoration:underline}
+code,pre,.mono{font-family:var(--mono);font-size:.85em}
+
+/* Top bar */
+#bar{background:var(--s1);border-bottom:1px solid var(--b1);height:44px;display:flex;align-items:center;padding:0 1.5rem;gap:.75rem;position:sticky;top:0;z-index:200}
+#bar-logo{font-family:var(--mono);font-weight:600;font-size:.85rem;color:var(--tx);letter-spacing:.08em}
+#bar-ver{font-family:var(--mono);font-size:.68rem;color:var(--t3);border:1px solid var(--b2);padding:.1rem .45rem;border-radius:3px}
+#bar-tenant{font-size:.78rem;color:var(--t2);margin-left:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:400px}
+
+/* Main layout */
+#layout{display:grid;grid-template-columns:220px 1fr;min-height:calc(100vh - 44px)}
+
+/* Sidebar */
+#sidebar{background:var(--s1);border-right:1px solid var(--b1);padding:1.25rem 0;position:sticky;top:44px;height:calc(100vh - 44px);overflow-y:auto}
+.nav-section{padding:.5rem 1rem .25rem;font-size:.65rem;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--t3)}
+.nav-item{display:flex;align-items:center;gap:.6rem;padding:.45rem 1.25rem;font-size:.8rem;color:var(--t2);cursor:pointer;border-left:2px solid transparent;transition:all .12s;user-select:none}
+.nav-item:hover{color:var(--tx);background:var(--s2)}
+.nav-item.active{color:var(--tx);border-left-color:var(--blu);background:var(--s2)}
+.nav-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.nav-badge{margin-left:auto;font-family:var(--mono);font-size:.65rem;background:var(--s3);color:var(--t2);padding:.1rem .4rem;border-radius:3px}
+.nav-badge.red{background:var(--red-d);color:var(--red)}
+
+/* Content */
+#content{padding:1.5rem 2rem;overflow-y:auto}
+.panel{display:none}.panel.active{display:block}
+
+/* Summary cards row */
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:.6rem;margin-bottom:1.25rem}
+.card{background:var(--s2);border:1px solid var(--b1);border-radius:var(--r);padding:.9rem 1.1rem;position:relative;overflow:hidden}
+.card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:2px}
+.card-n{font-family:var(--mono);font-size:2rem;font-weight:600;line-height:1;margin-bottom:.2rem}
+.card-l{font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:var(--t2)}
+.c-crit::before{background:var(--red)} .c-crit .card-n{color:var(--red)}
+.c-high::before{background:var(--ora)} .c-high .card-n{color:var(--ora)}
+.c-med::before {background:var(--yel)} .c-med  .card-n{color:var(--yel)}
+.c-low::before {background:var(--blu)} .c-low  .card-n{color:var(--blu)}
+
+/* Risk bar */
+.rbar{height:4px;background:var(--s3);border-radius:2px;overflow:hidden;display:flex;margin-bottom:1.25rem}
+.rbar-s{height:100%}
+
+/* Section heading */
+.sh{font-size:.7rem;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--t3);margin-bottom:.6rem;display:flex;align-items:center;gap:.5rem}
+.sh::after{content:'';flex:1;height:1px;background:var(--b1)}
+
+/* Toolbar */
+.tb{display:flex;gap:.4rem;margin-bottom:.65rem;align-items:center;flex-wrap:wrap}
+.fb{background:var(--s2);border:1px solid var(--b1);color:var(--t2);border-radius:3px;padding:.22rem .65rem;font-size:.72rem;cursor:pointer;font-family:var(--sans);transition:all .12s;white-space:nowrap}
+.fb:hover{color:var(--tx);border-color:var(--b3)}
+.fb.on{color:var(--tx);border-color:var(--b2);background:var(--s3)}
+.fb.fc.on{color:var(--red);border-color:var(--red-b);background:var(--red-d)}
+.fb.fh.on{color:var(--ora);border-color:var(--ora-b);background:var(--ora-d)}
+.fb.fm.on{color:var(--yel);border-color:var(--yel-b);background:var(--yel-d)}
+.fb.fl.on{color:var(--blu);border-color:var(--blu-b);background:var(--blu-d)}
+.srch{background:var(--s2);border:1px solid var(--b1);color:var(--tx);border-radius:3px;padding:.22rem .65rem;font-size:.75rem;font-family:var(--sans);width:200px;margin-left:auto}
+.srch:focus{outline:none;border-color:var(--b3)}
+.srch::placeholder{color:var(--t4)}
+.cnt{font-family:var(--mono);font-size:.68rem;color:var(--t3);padding:.1rem .4rem;background:var(--s3);border-radius:3px}
+
+/* Findings table */
+.ftbl{width:100%;border-collapse:collapse;font-size:.8rem}
+.ftbl thead th{background:var(--s2);padding:.5rem .75rem;text-align:left;font-size:.65rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--t3);border-bottom:1px solid var(--b1);white-space:nowrap}
+.fr{border-bottom:1px solid var(--s2);transition:background .1s}
+.fr:hover>td{background:var(--s2)}
+.fr>td{padding:.5rem .75rem;vertical-align:top}
+.er>td{padding:0;background:var(--bg)}
+.ed{padding:.6rem .75rem .6rem 2.5rem;border-left:2px solid var(--b2);margin:.25rem .75rem .35rem 2.75rem}
+
+/* Severity pills */
+.sp{font-family:var(--mono);font-size:.63rem;font-weight:600;letter-spacing:.08em;padding:.15rem .5rem;border-radius:3px;display:inline-block;white-space:nowrap}
+.sc{background:var(--red-d);color:var(--red);border:1px solid var(--red-b)}
+.sh{background:var(--ora-d);color:var(--ora);border:1px solid var(--ora-b)}
+.sm{background:var(--yel-d);color:var(--yel);border:1px solid var(--yel-b)}
+.sl{background:var(--blu-d);color:var(--blu);border:1px solid var(--blu-b)}
+
+.tc{color:var(--t3);font-family:var(--mono);font-size:.7rem;white-space:nowrap;vertical-align:top;padding-top:.6rem}
+.mt{color:var(--tx);display:block;line-height:1.5;max-width:540px}
+.ra{display:flex;gap:.5rem;align-items:center;margin-top:.3rem;flex-wrap:wrap}
+.tac{color:var(--t2);font-size:.72rem;white-space:nowrap}
+.eb{background:none;border:1px solid var(--b2);color:var(--t2);border-radius:3px;width:20px;height:20px;cursor:pointer;font-size:.75rem;font-family:var(--mono);display:flex;align-items:center;justify-content:center;transition:all .1s;flex-shrink:0}
+.eb:hover{border-color:var(--b3);color:var(--tx)}
+.cl{font-family:var(--mono);font-size:.68rem;color:var(--grn);border:1px solid var(--grn-d);padding:.1rem .4rem;border-radius:3px}
+.cl:hover{background:var(--grn-d)}
+.ml{font-family:var(--mono);font-size:.7rem;color:var(--teal)}
+
+/* Evidence table */
+.etbl{border-collapse:collapse;font-size:.75rem;min-width:320px}
+.etbl td{padding:.22rem .6rem;border-bottom:1px solid var(--s3);vertical-align:top}
+.ek{color:var(--t3);font-family:var(--mono);white-space:nowrap;padding-right:1rem;font-size:.7rem}
+.ev{color:var(--t2);word-break:break-all;font-family:var(--mono);font-size:.72rem}
+
+/* Users table */
+.ut{width:100%;border-collapse:collapse;font-size:.8rem}
+.ut thead th{background:var(--s2);padding:.45rem .75rem;text-align:left;font-size:.65rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--t3);border-bottom:1px solid var(--b1)}
+.ut tbody tr{border-bottom:1px solid var(--s2)}
+.ut tbody td{padding:.45rem .75rem}
+.upn{font-family:var(--mono);font-size:.75rem;color:var(--tx)}
+.n{font-family:var(--mono);font-weight:600}
+.n.sc{color:var(--red)} .n.sh{color:var(--ora)}
+.rs{font-family:var(--mono);font-size:.72rem;padding:.15rem .5rem;border-radius:3px;font-weight:600}
+.rs.sc{background:var(--red-d);color:var(--red)}
+.rs.sh{background:var(--ora-d);color:var(--ora)}
+.rs.sm{background:var(--yel-d);color:var(--yel)}
+.sm-txt{font-size:.72rem;color:var(--t2)}
+
+/* Module grid */
+.mgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:.5rem}
+.mc2{background:var(--s2);border:1px solid var(--b1);border-radius:var(--r);padding:.6rem .85rem;display:flex;align-items:center;gap:.6rem}
+.md{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.mo{background:var(--grn)} .mw{background:var(--yel)} .ms{background:var(--t4)}
+.mn{font-size:.78rem;color:var(--tx);flex:1}
+.ml2{font-size:.68rem;color:var(--t3);font-family:var(--mono);white-space:nowrap}
+
+/* Run info */
+.rgrid{display:grid;grid-template-columns:1fr 1fr;gap:.5rem}
+.rrow{display:flex;justify-content:space-between;padding:.4rem .75rem;background:var(--s2);border:1px solid var(--b1);border-radius:var(--r);font-size:.78rem;gap:1rem}
+.rk{color:var(--t2)} .rv{font-family:var(--mono);color:var(--tx);text-align:right;font-size:.72rem;word-break:break-all}
+
+/* MITRE */
+.mitre-wrap{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:.4rem}
+.mt-cell{background:var(--s2);border:1px solid var(--b1);border-radius:var(--r);padding:.5rem .65rem;text-align:center}
+.mt-cell.hit{background:var(--red-d);border-color:var(--red-b)}
+.mt-cell.par{background:var(--ora-d);border-color:var(--ora-b)}
+.mt-cell.nt {border-color:var(--b1)}
+.mt-name{font-size:.65rem;font-weight:500;margin-bottom:.2rem}
+.mt-cell.hit .mt-name{color:var(--red)} .mt-cell.par .mt-name{color:var(--ora)} .mt-cell.nt .mt-name{color:var(--t3)}
+.mt-count{font-family:var(--mono);font-size:.75rem;font-weight:600}
+.mt-cell.hit .mt-count{color:var(--red)} .mt-cell.par .mt-count{color:var(--ora)} .mt-cell.nt .mt-count{color:var(--t4)}
+
+.empty{color:var(--t3);font-size:.8rem;padding:1.5rem 0;text-align:center}
+
+@keyframes fi{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
+.panel.active{animation:fi .15s ease}
 </style>
 </head>
 <body>
 
-<h1>IR-O365 &mdash; Incident Response Report</h1>
-<p class="tenant-badge">$([System.Web.HttpUtility]::HtmlEncode($Script:TenantName)) &nbsp;&nbsp;|&nbsp;&nbsp; $([System.Web.HttpUtility]::HtmlEncode($Script:TenantId))</p>
-<p class="subtitle">MITRE ATT&amp;CK Enterprise v18 &nbsp;|&nbsp; Gerado: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') &nbsp;|&nbsp; Periodo: $($Script:StartDate.ToString('yyyy-MM-dd')) &rarr; $($Script:EndDate.ToString('yyyy-MM-dd')) &nbsp;|&nbsp; IR-O365 v$($Script:Version)</p>
-
-<div class="stats">
-  <div class="stat-card critical"><div class="num">$critCount</div><div class="label">CRITICAL</div></div>
-  <div class="stat-card high"><div class="num">$highCount</div><div class="label">HIGH</div></div>
-  <div class="stat-card medium"><div class="num">$medCount</div><div class="label">MEDIUM</div></div>
-  <div class="stat-card low"><div class="num">$lowCount</div><div class="label">LOW</div></div>
+<div id="bar">
+  <span id="bar-logo">IR&#x2013;O365</span>
+  <span id="bar-ver">v$($Script:Version)</span>
+  <span id="bar-tenant">$(hx $Script:TenantName) &nbsp;&middot;&nbsp; $(hx $Script:TenantId)</span>
 </div>
 
-$threatSummarySection
+<div id="layout">
 
-<hr class="section-divider">
+<!-- Sidebar -->
+<nav id="sidebar">
+  <div class="nav-section">Relatorio</div>
+  <div class="nav-item active" onclick="sw(this,'findings')">
+    <span class="nav-dot" style="background:var(--blu)"></span>
+    Findings
+    <span class="nav-badge$(if($critCount -gt 0){' red'} else {''})" id="fc">$totalFindings</span>
+  </div>
+  <div class="nav-item" onclick="sw(this,'users')">
+    <span class="nav-dot" style="background:var(--pur)"></span>
+    Utilizadores em Risco
+  </div>
+  <div class="nav-item" onclick="sw(this,'modules')">
+    <span class="nav-dot" style="background:var(--teal)"></span>
+    Modulos
+  </div>
+  <div class="nav-item" onclick="sw(this,'mitre')">
+    <span class="nav-dot" style="background:var(--grn)"></span>
+    MITRE ATT&amp;CK
+  </div>
+  <div class="nav-item" onclick="sw(this,'runinfo')">
+    <span class="nav-dot" style="background:var(--t2)"></span>
+    Execucao
+  </div>
+  <div class="nav-section" style="margin-top:1rem">Severidade</div>
+  <div class="nav-item" onclick="flt(this,'CRITICAL')" id="nc" style="gap:.5rem">
+    <span style="font-family:var(--mono);color:var(--red);font-size:.7rem;font-weight:600">CRITICAL</span>
+    <span class="nav-badge red">$critCount</span>
+  </div>
+  <div class="nav-item" onclick="flt(this,'HIGH')" style="gap:.5rem">
+    <span style="font-family:var(--mono);color:var(--ora);font-size:.7rem;font-weight:600">HIGH</span>
+    <span class="nav-badge">$highCount</span>
+  </div>
+  <div class="nav-item" onclick="flt(this,'MEDIUM')" style="gap:.5rem">
+    <span style="font-family:var(--mono);color:var(--yel);font-size:.7rem;font-weight:600">MEDIUM</span>
+    <span class="nav-badge">$medCount</span>
+  </div>
+  <div class="nav-item" onclick="flt(this,'LOW')" style="gap:.5rem">
+    <span style="font-family:var(--mono);color:var(--blu);font-size:.7rem;font-weight:600">LOW</span>
+    <span class="nav-badge">$lowCount</span>
+  </div>
+</nav>
 
-<h2 style="margin-bottom:.75rem">Findings ($totalFindings total)</h2>
+<!-- Content -->
+<main id="content">
 
-<div class="filter-bar">
-  <button class="filter-btn active" onclick="filterSev('ALL')">Todos</button>
-  <button class="filter-btn" onclick="filterSev('CRITICAL')" style="border-color:#ff444444">CRITICAL</button>
-  <button class="filter-btn" onclick="filterSev('HIGH')"     style="border-color:#ff8c0044">HIGH</button>
-  <button class="filter-btn" onclick="filterSev('MEDIUM')"   style="border-color:#ffc10744">MEDIUM</button>
-  <button class="filter-btn" onclick="filterSev('LOW')"      style="border-color:#17a2b844">LOW</button>
-  <input class="search-box" type="text" placeholder="Filtrar findings..." oninput="searchFindings(this.value)">
-</div>
+<!-- PANEL: Findings -->
+<div class="panel active" id="p-findings">
+  <div class="sh">Overview</div>
+  <div class="cards">
+    <div class="card c-crit"><div class="card-n">$critCount</div><div class="card-l">Critical</div></div>
+    <div class="card c-high"><div class="card-n">$highCount</div><div class="card-l">High</div></div>
+    <div class="card c-med"> <div class="card-n">$medCount</div><div class="card-l">Medium</div></div>
+    <div class="card c-low"> <div class="card-n">$lowCount</div><div class="card-l">Low</div></div>
+  </div>
+  <div class="rbar" id="rb"></div>
 
-<table id="findings-table">
-  <thead>
-    <tr>
-      <th style="width:90px">Severity</th>
-      <th style="width:130px">Timestamp</th>
+  <div class="sh" style="margin-top:.75rem">Findings ($totalFindings)</div>
+  <div class="tb">
+    <button class="fb on" onclick="flt(this,'ALL')">Todos</button>
+    <button class="fb fc" onclick="flt(this,'CRITICAL')">CRITICAL</button>
+    <button class="fb fh" onclick="flt(this,'HIGH')">HIGH</button>
+    <button class="fb fm" onclick="flt(this,'MEDIUM')">MEDIUM</button>
+    <button class="fb fl" onclick="flt(this,'LOW')">LOW</button>
+    <input class="srch" type="text" placeholder="Pesquisar findings..." oninput="srch(this.value)">
+    <span class="cnt" id="vc">$totalFindings</span>
+  </div>
+  <table class="ftbl">
+    <thead><tr>
+      <th style="width:82px">Severity</th>
+      <th style="width:48px">Hora</th>
       <th>Finding</th>
-      <th style="width:130px">MITRE</th>
-      <th style="width:150px">Tactic</th>
-    </tr>
-  </thead>
-  <tbody id="findings-body">
-    $findingsHTML
-  </tbody>
-</table>
+      <th style="width:120px">Tatica</th>
+    </tr></thead>
+    <tbody id="fb">$findingsHTML</tbody>
+  </table>
+</div>
 
-<hr class="section-divider">
+<!-- PANEL: Users -->
+<div class="panel" id="p-users">
+  <div class="sh">Utilizadores com Findings CRITICAL / HIGH</div>
+  $usersSection
+</div>
 
-<h2 style="margin-bottom:.75rem">Estado dos Modulos</h2>
-<table>
-  <thead><tr><th>Modulo</th><th>Estado</th><th>Evidencias</th></tr></thead>
-  <tbody>$moduleStatusHTML</tbody>
-</table>
+<!-- PANEL: Modules -->
+<div class="panel" id="p-modules">
+  <div class="sh">Estado dos Modulos</div>
+  <div class="mgrid">$modCards</div>
+</div>
 
-<div class="meta" style="margin-top:2rem">
-  <div class="meta-card">
-    <h3>Cobertura MITRE ATT&amp;CK</h3>
-    <p>
-      Initial Access: T1078, T1110, T1566<br>
-      Execution: T1059.009, T1648<br>
-      Persistence: T1098, T1136, T1137, T1671<br>
-      Defense Evasion: T1562, T1070, T1550, T1606, T1556, T1672<br>
-      Credential Access: T1528, T1539, T1552, T1621<br>
-      Collection: T1114, T1213, T1530<br>
-      Exfiltration: T1048, T1537, T1567<br>
-      Impact: T1531, T1657, T1667
-    </p>
-  </div>
-  <div class="meta-card">
-    <h3>Notas de Execucao</h3>
-    <p>
-      Exchange Online: $(if (Test-EXOAvailable) { 'Conectado' } else { 'Nao disponivel (EXO broker bug)' })<br>
-      Microsoft Graph: $(try { $ctx = Get-MgContext -ErrorAction SilentlyContinue; if ($ctx) { $ctx.Account } else { 'Nao conectado' } } catch { 'N/A' })<br>
-      Entra ID P2: $(if (($Script:Stats.CRITICAL + $Script:Stats.HIGH) -gt 0 -and $critCount -gt 0) { 'Verificar licenca' } else { 'Nao determinado' })<br>
-      Duracao total: $duration minutos<br>
-      PS Version: v$($PSVersionTable.PSVersion)<br>
-      Output: $([System.Web.HttpUtility]::HtmlEncode($Script:OutputPath))
-    </p>
+<!-- PANEL: MITRE -->
+<div class="panel" id="p-mitre">
+  <div class="sh">MITRE ATT&amp;CK Office Suite v18</div>
+  <p style="font-size:.75rem;color:var(--t2);margin-bottom:.85rem">Taticas com findings detetados nesta analise. Vermelho = findings; Laranja = 1-2 findings; Cinzento = sem cobertura.</p>
+  <div class="mitre-wrap" id="mg"></div>
+</div>
+
+<!-- PANEL: Run info -->
+<div class="panel" id="p-runinfo">
+  <div class="sh">Informacao de Execucao</div>
+  <div class="rgrid">
+    <div class="rrow"><span class="rk">Tenant</span><span class="rv">$(hx $Script:TenantName)</span></div>
+    <div class="rrow"><span class="rk">Tenant ID</span><span class="rv">$(hx $Script:TenantId)</span></div>
+    <div class="rrow"><span class="rk">Periodo</span><span class="rv">$($Script:StartDate.ToString('yyyy-MM-dd')) / $($Script:EndDate.ToString('yyyy-MM-dd'))</span></div>
+    <div class="rrow"><span class="rk">Dias analisados</span><span class="rv">$Script:DaysBack</span></div>
+    <div class="rrow"><span class="rk">Duracao</span><span class="rv">${duration} min</span></div>
+    <div class="rrow"><span class="rk">Script</span><span class="rv">IR-O365 v$($Script:Version)</span></div>
+    <div class="rrow"><span class="rk">PowerShell</span><span class="rv">$psVer</span></div>
+    <div class="rrow"><span class="rk">Exchange Online</span><span class="rv">$exoSt</span></div>
+    <div class="rrow"><span class="rk">Microsoft Graph</span><span class="rv">$(hx $graphAcc)</span></div>
+    <div class="rrow"><span class="rk">Total findings</span><span class="rv">$totalFindings</span></div>
+    <div class="rrow" style="grid-column:1/-1"><span class="rk">Output path</span><span class="rv" style="font-size:.65rem">$(hx $Script:OutputPath)</span></div>
   </div>
 </div>
 
-<p class="footer">IR-O365 v$($Script:Version) &nbsp;|&nbsp; MITRE ATT&amp;CK Enterprise (Office Suite) v18 &nbsp;|&nbsp; Duracao: $duration min</p>
+</main>
+</div>
 
 <script>
-function toggleEvidence(id) {
-  var row = document.getElementById(id);
-  var btn = row.previousElementSibling.querySelector('.expand-btn');
-  if (row.style.display === 'none') {
-    row.style.display = 'table-row';
-    if (btn) btn.textContent = '- evidencias';
-  } else {
-    row.style.display = 'none';
-    if (btn) btn.textContent = '+ evidencias';
+var FR = Array.from(document.querySelectorAll('tr.fr'));
+var curS = 'ALL', curQ = '';
+
+function sw(btn, id) {
+  document.querySelectorAll('.nav-item').forEach(function(b){ b.classList.remove('active'); });
+  document.querySelectorAll('.panel').forEach(function(p){ p.classList.remove('active'); });
+  btn.classList.add('active');
+  document.getElementById('p-' + id).classList.add('active');
+  if (id === 'findings') buildMitre();
+}
+
+function flt(btn, sev) {
+  if (btn.classList.contains('nav-item')) {
+    sw(document.querySelector('.nav-item'), 'findings');
+    document.querySelector('.nav-item').classList.remove('active');
+    document.querySelector('[onclick*="findings"]').classList.add('active');
   }
+  document.querySelectorAll('.tb .fb').forEach(function(b){ b.classList.remove('on'); });
+  if (btn.classList.contains('fb')) btn.classList.add('on');
+  curS = sev; apply();
 }
 
-function filterSev(sev) {
-  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-  event.target.classList.add('active');
-  var rows = document.querySelectorAll('#findings-body tr.finding-row');
-  rows.forEach(function(row) {
-    var evRow = row.nextElementSibling;
-    var show = sev === 'ALL' || row.classList.contains('sev-' + sev.toLowerCase());
-    row.style.display = show ? '' : 'none';
-    if (evRow && evRow.classList.contains('evidence-row')) {
-      if (!show) evRow.style.display = 'none';
-    }
+function srch(q){ curQ = q.toLowerCase(); apply(); }
+
+function apply() {
+  var v = 0;
+  FR.forEach(function(r) {
+    var er = r.nextElementSibling;
+    var ok = (curS === 'ALL' || r.dataset.sev === curS) && (!curQ || r.textContent.toLowerCase().includes(curQ));
+    r.style.display = ok ? '' : 'none';
+    if (er && er.classList.contains('er') && !ok) er.style.display = 'none';
+    if (ok) v++;
+  });
+  document.getElementById('vc').textContent = v;
+  document.getElementById('fc').textContent = v;
+}
+
+function te(id) {
+  var r = document.getElementById(id);
+  var b = r.previousElementSibling.querySelector('.eb');
+  var open = r.style.display !== 'none';
+  r.style.display = open ? 'none' : '';
+  if (b) b.textContent = open ? '+' : '-';
+}
+
+(function riskBar(){
+  var c=$critCount,h=$highCount,m=$medCount,l=$lowCount,t=c+h+m+l||1;
+  var rb=document.getElementById('rb');
+  if(c) rb.innerHTML+='<div class="rbar-s" style="width:'+(c/t*100)+'%;background:var(--red)"></div>';
+  if(h) rb.innerHTML+='<div class="rbar-s" style="width:'+(h/t*100)+'%;background:var(--ora)"></div>';
+  if(m) rb.innerHTML+='<div class="rbar-s" style="width:'+(m/t*100)+'%;background:var(--yel)"></div>';
+  if(l) rb.innerHTML+='<div class="rbar-s" style="width:'+(l/t*100)+'%;background:var(--blu)"></div>';
+})();
+
+function buildMitre(){
+  var tacs={'Initial Access':0,'Execution':0,'Persistence':0,'Privilege Escalation':0,
+    'Defense Evasion':0,'Credential Access':0,'Discovery':0,'Lateral Movement':0,
+    'Collection':0,'Exfiltration':0,'Impact':0};
+  FR.forEach(function(r){ var t=r.dataset.tac; if(t&&tacs.hasOwnProperty(t)) tacs[t]++; });
+  var g=document.getElementById('mg'); g.innerHTML='';
+  Object.keys(tacs).forEach(function(t){
+    var n=tacs[t];
+    var cls=n>2?'hit':n>0?'par':'nt';
+    g.innerHTML+='<div class="mt-cell '+cls+'"><div class="mt-name">'+t+'</div><div class="mt-count">'+(n||'&#x2013;')+'</div></div>';
   });
 }
+buildMitre();
 
-function searchFindings(q) {
-  var query = q.toLowerCase();
-  var rows = document.querySelectorAll('#findings-body tr.finding-row');
-  rows.forEach(function(row) {
-    var text = row.textContent.toLowerCase();
-    var evRow = row.nextElementSibling;
-    var show = !query || text.includes(query);
-    row.style.display = show ? '' : 'none';
-    if (evRow && evRow.classList.contains('evidence-row')) {
-      if (!show) evRow.style.display = 'none';
-    }
-  });
-}
-
-// Auto-expand CRITICAL findings on load
-window.addEventListener('load', function() {
-  document.querySelectorAll('tr.sev-critical').forEach(function(row) {
-    var evRow = row.nextElementSibling;
-    if (evRow && evRow.classList.contains('evidence-row')) {
-      evRow.style.display = 'table-row';
-      var btn = row.querySelector('.expand-btn');
-      if (btn) btn.textContent = '- evidencias';
-    }
+window.addEventListener('load',function(){
+  FR.filter(function(r){return r.dataset.sev==='CRITICAL';}).forEach(function(r){
+    var er=r.nextElementSibling;
+    if(er&&er.classList.contains('er')){er.style.display='';var b=r.querySelector('.eb');if(b)b.textContent='-';}
   });
 });
 </script>
-
 </body>
 </html>
 "@
 
     $reportPath = Join-Path $Script:OutputPath "IR_REPORT.html"
     $html | Out-File -FilePath $reportPath -Encoding UTF8
-    Write-IRLog "HTML Report gerado: $reportPath" -Severity "SUCCESS"
+
+    $reportFullPath = (Resolve-Path $reportPath -ErrorAction SilentlyContinue).Path
+    if (-not $reportFullPath) { $reportFullPath = [System.IO.Path]::GetFullPath($reportPath) }
+    $reportUri = "file:///" + $reportFullPath.Replace("\", "/")
+
+    Write-Host ""
+    Write-Host "  HTML Report gerado:" -ForegroundColor Green
+    Write-Host "  $reportUri" -ForegroundColor Cyan
+    Write-Host ""
+    Write-IRLog "HTML Report: $reportUri" -Severity "SUCCESS"
 }
+
 
 function New-DebugLog {
     # Exportar debug log completo - sempre gerado, independente de -ExportJSON
@@ -2887,7 +2870,7 @@ function Get-PrivilegedIdentityDeepDive {
         Export-IRData -FileName "17_privileged_identity_inventory" -Data $privilegedInventory
 
         # Global Admins count (> 5 e considerado risco)
-        $globalAdmins = $privilegedInventory | Where-Object { $_.RoleName -eq "Global Administrator" }
+        $globalAdmins = @($privilegedInventory | Where-Object { $_.RoleName -eq "Global Administrator" })
         if ($globalAdmins.Count -gt 5) {
             Write-IRLog "Demasiados Global Admins: $($globalAdmins.Count) (best practice: max 4-5) [T1098.003]" `
                 -Severity "MEDIUM" -MITRETechnique "T1098.003" -MITRETactic "Privilege Escalation"
@@ -2895,10 +2878,10 @@ function Get-PrivilegedIdentityDeepDive {
 
         # Break-glass accounts (should exist, should NOT be used regularly)
         Write-Host "  >> Verificando break-glass accounts..." -ForegroundColor Gray
-        $breakGlass = $privilegedInventory | Where-Object {
+        $breakGlass = @($privilegedInventory | Where-Object {
             $_.RoleName -eq "Global Administrator" -and
             ($_.UPN -match "break|glass|emergency|breakglass|bga" -or $_.UPN -match "admin.*admin")
-        }
+        })
         if ($breakGlass.Count -gt 0) {
             foreach ($bg in $breakGlass) {
                 if ($bg.DaysSinceLogin -ne "Never/Unknown" -and [int]$bg.DaysSinceLogin -lt 30) {
@@ -3137,6 +3120,386 @@ function Get-DeviceAnomalies {
 # MODULO 21: ATTACK TIMELINE RECONSTRUCTION
 # ============================================================
 
+# ============================================================
+# MODULO 24: MFA FATIGUE / PUSH BOMBING DETECTION (T1621)
+# ============================================================
+
+function Get-MFAFatigueHunting {
+    # T1621 - Multi-Factor Authentication Request Generation
+    # Atacante envia multiplos pedidos MFA ate utilizador aceitar por exaustao
+    Write-Section "MFA FATIGUE / PUSH BOMBING" "T1621" "Credential Access"
+
+    if ($Script:SkipGraph) { Write-IRLog "Graph skipped" -Severity "INFO"; return }
+
+    try {
+        Write-Host "  >> A analisar padroes de MFA fatigue..." -ForegroundColor Gray
+
+        $filterDate = $Script:FilterDate
+
+        # Obter sign-ins com MFA nos ultimos N dias
+        $mfaSignins = @(Get-MgAuditLogSignIn -Filter `
+            "createdDateTime ge $filterDate" `
+            -Top 5000 -ErrorAction SilentlyContinue |
+            Where-Object { $_.AuthenticationRequirement -eq "multiFactorAuthentication" -or
+                           $_.ConditionalAccessStatus -ne $null })
+
+        if ($mfaSignins.Count -eq 0) {
+            Write-IRLog "MFA Fatigue: sem sign-ins MFA no periodo (ou licenca P2 necessaria para detalhe)" -Severity "INFO"
+            return
+        }
+
+        # Agrupar por utilizador e procurar padroes de fadiga:
+        # Muitas tentativas MFA num curto espaco de tempo -> eventual sucesso
+        $fatigueUsers = [System.Collections.Generic.List[PSObject]]::new()
+        $byUser = $mfaSignins | Group-Object UserPrincipalName
+
+        foreach ($userGrp in $byUser) {
+            $userEvents = @($userGrp.Group | Sort-Object CreatedDateTime)
+            if ($userEvents.Count -lt 3) { continue }
+
+            # Janela deslizante de 30 minutos
+            for ($i = 0; $i -lt $userEvents.Count - 2; $i++) {
+                $window = @($userEvents | Where-Object {
+                    $_.CreatedDateTime -ge $userEvents[$i].CreatedDateTime -and
+                    $_.CreatedDateTime -le $userEvents[$i].CreatedDateTime.AddMinutes(30)
+                })
+
+                $failures = @($window | Where-Object { $_.Status.ErrorCode -ne 0 })
+                $successes = @($window | Where-Object { $_.Status.ErrorCode -eq 0 })
+
+                # Indicador: 3+ falhas MFA seguidas de sucesso na mesma janela
+                if ($failures.Count -ge 3 -and $successes.Count -ge 1) {
+                    $lastFail    = ($failures | Sort-Object CreatedDateTime -Descending)[0]
+                    $firstSucess = ($successes | Sort-Object CreatedDateTime)[0]
+
+                    # Sucesso deve ser APOS as falhas
+                    if ($firstSucess.CreatedDateTime -gt $lastFail.CreatedDateTime) {
+                        $record = [PSCustomObject]@{
+                            UserPrincipalName = $userGrp.Name
+                            MFAFailures       = $failures.Count
+                            EventualSuccess   = $true
+                            WindowMinutes     = 30
+                            FailureIPs        = ($failures.IPAddress | Sort-Object -Unique) -join ";"
+                            SuccessIP         = $firstSucess.IPAddress
+                            FirstEvent        = $userEvents[$i].CreatedDateTime
+                            SuccessAt         = $firstSucess.CreatedDateTime
+                            SameIP            = (($failures.IPAddress | Sort-Object -Unique) -contains $firstSucess.IPAddress)
+                        }
+                        $fatigueUsers.Add($record)
+                        $sev = if ($record.MFAFailures -ge 10) { "CRITICAL" } else { "HIGH" }
+                        Write-IRLog "MFA Fatigue detectado: $($userGrp.Name) -> $($failures.Count) falhas + sucesso em 30min [T1621]" `
+                            -Severity $sev -MITRETechnique "T1621" -MITRETactic "Credential Access" -Data $record
+                        break
+                    }
+                }
+            }
+        }
+
+        if ($fatigueUsers.Count -gt 0) {
+            Export-IRData -FileName "24_mfa_fatigue_suspects" -Data $fatigueUsers
+        } else {
+            Write-IRLog "MFA Fatigue: sem padroes de fadiga detetados" -Severity "INFO"
+        }
+
+        # Adicionalmente: Device Code Phishing (tokens emitidos via device flow de IPs suspeitos)
+        Write-Host "  >> A verificar Device Code phishing..." -ForegroundColor Gray
+        $deviceCodeSignins = @(Get-MgAuditLogSignIn -Filter `
+            "createdDateTime ge $filterDate and authenticationProtocol eq 'deviceCode'" `
+            -Top 500 -ErrorAction SilentlyContinue)
+
+        if ($deviceCodeSignins.Count -gt 0) {
+            $highRiskCountries = @("CN","RU","KP","IR","SY","BY","MM","AF")
+            $suspectDeviceCode = @($deviceCodeSignins | Where-Object {
+                $_.Location.CountryOrRegion -in $highRiskCountries -or
+                $_.RiskLevelDuringSignIn -ne "none"
+            })
+            if ($suspectDeviceCode.Count -gt 0) {
+                Write-IRLog "Device Code Phishing: $($suspectDeviceCode.Count) sign-ins via Device Code de paises de risco [T1078/T1621]" `
+                    -Severity "HIGH" -MITRETechnique "T1621" -MITRETactic "Credential Access"
+                Export-IRData -FileName "24_device_code_suspicious" -Data ($suspectDeviceCode | `
+                    Select-Object UserPrincipalName, CreatedDateTime, IPAddress, `
+                    @{N="Country";E={$_.Location.CountryOrRegion}}, RiskLevelDuringSignIn)
+            } else {
+                Write-IRLog "Device Code: $($deviceCodeSignins.Count) sign-ins, sem indicadores de phishing" -Severity "INFO"
+            }
+            Export-IRData -FileName "24_device_code_all" -Data ($deviceCodeSignins | `
+                Select-Object UserPrincipalName, CreatedDateTime, IPAddress, `
+                @{N="Country";E={$_.Location.CountryOrRegion}}, AppDisplayName)
+        }
+
+    } catch {
+        Write-DebugError "MFAFatigue" "Erro no modulo" $_
+    }
+}
+
+# ============================================================
+# MODULO 25: DISPLAY NAME IMPERSONATION HUNTING (T1656)
+# ============================================================
+
+function Get-ImpersonationHunting {
+    # T1656 - Impersonation
+    # Atacantes criam contas/guests com display names identicos a utilizadores internos
+    Write-Section "IMPERSONATION / DISPLAY NAME SPOOFING" "T1656" "Defense Evasion"
+
+    if ($Script:SkipGraph) { Write-IRLog "Graph skipped" -Severity "INFO"; return }
+
+    try {
+        Write-Host "  >> A recolher todos os utilizadores internos..." -ForegroundColor Gray
+
+        # Todos os utilizadores internos
+        $internalUsers = @(Get-MgUser -All `
+            -Property "Id,DisplayName,UserPrincipalName,UserType,Mail" `
+            -Filter "userType eq 'Member'" `
+            -ErrorAction SilentlyContinue)
+
+        # Todos os guests
+        $guestUsers = @(Get-MgUser -All `
+            -Property "Id,DisplayName,UserPrincipalName,UserType,Mail,CreatedDateTime" `
+            -Filter "userType eq 'Guest'" `
+            -ErrorAction SilentlyContinue)
+
+        Write-Host "  >> A comparar display names ($($internalUsers.Count) internos, $($guestUsers.Count) guests)..." -ForegroundColor Gray
+
+        $spoofMatches = [System.Collections.Generic.List[PSObject]]::new()
+
+        # Construir set de nomes internos para lookup rapido
+        $internalNames = @{}
+        foreach ($u in $internalUsers) {
+            if ($u.DisplayName) {
+                $key = $u.DisplayName.Trim().ToLower()
+                $internalNames[$key] = $u.UserPrincipalName
+            }
+        }
+
+        foreach ($guest in $guestUsers) {
+            if (-not $guest.DisplayName) { continue }
+            $guestName = $guest.DisplayName.Trim().ToLower()
+
+            # Match exacto
+            if ($internalNames.ContainsKey($guestName)) {
+                $record = [PSCustomObject]@{
+                    GuestUPN      = $guest.UserPrincipalName
+                    GuestDisplay  = $guest.DisplayName
+                    MatchedInternal = $internalNames[$guestName]
+                    MatchType     = "Exact"
+                    CreatedDate   = $guest.CreatedDateTime
+                }
+                $spoofMatches.Add($record)
+                Write-IRLog "Impersonation EXACT: Guest '$($guest.DisplayName)' = interno '$($internalNames[$guestName])' [T1656]" `
+                    -Severity "HIGH" -MITRETechnique "T1656" -MITRETactic "Defense Evasion" -Data $record
+                continue
+            }
+
+            # Match aproximado: remover espacos/pontos e comparar
+            $guestNorm = $guestName -replace '[\s\.\-_]',''
+            foreach ($intName in $internalNames.Keys) {
+                $intNorm = $intName -replace '[\s\.\-_]',''
+                if ($guestNorm -eq $intNorm -and $guestNorm.Length -gt 4) {
+                    $record = [PSCustomObject]@{
+                        GuestUPN        = $guest.UserPrincipalName
+                        GuestDisplay    = $guest.DisplayName
+                        MatchedInternal = $internalNames[$intName]
+                        MatchType       = "Normalized"
+                        CreatedDate     = $guest.CreatedDateTime
+                    }
+                    $spoofMatches.Add($record)
+                    Write-IRLog "Impersonation APPROX: Guest '$($guest.DisplayName)' ~= interno '$($internalNames[$intName])' [T1656]" `
+                        -Severity "MEDIUM" -MITRETechnique "T1656" -MITRETactic "Defense Evasion" -Data $record
+                    break
+                }
+            }
+        }
+
+        # Verificar tambem Service Principals com nomes suspeitos
+        Write-Host "  >> A verificar Service Principals com nomes de utilizadores..." -ForegroundColor Gray
+        $sps = @(Get-MgServicePrincipal -All -Property "Id,DisplayName,AppId,CreatedDateTime" `
+            -ErrorAction SilentlyContinue | Where-Object {
+                $_.DisplayName -and $internalNames.ContainsKey($_.DisplayName.Trim().ToLower())
+            })
+
+        foreach ($sp in $sps) {
+            Write-IRLog "SP com nome de utilizador interno: '$($sp.DisplayName)' [T1656/T1098.003]" `
+                -Severity "HIGH" -MITRETechnique "T1656" -MITRETactic "Defense Evasion" `
+                -Data @{ SPName = $sp.DisplayName; AppId = $sp.AppId; Created = $sp.CreatedDateTime }
+        }
+
+        if ($spoofMatches.Count -gt 0) {
+            Export-IRData -FileName "25_impersonation_matches" -Data $spoofMatches
+        } else {
+            Write-IRLog "Impersonation: sem display name spoofing detetado" -Severity "INFO"
+        }
+
+        # Verificar tambem OAuth apps de tenants externos (consent phishing refinado)
+        Write-Host "  >> A verificar OAuth apps de tenants externos..." -ForegroundColor Gray
+        $oauthGrants = @(Get-MgOauth2PermissionGrant -All -ErrorAction SilentlyContinue)
+        $externalApps = [System.Collections.Generic.List[PSObject]]::new()
+
+        $highRiskScopes = @("Mail.ReadWrite","Mail.Read","Files.ReadWrite.All",
+                            "Calendars.ReadWrite","MailboxSettings.ReadWrite","full_access_as_user")
+
+        $seenApps = @{}
+        foreach ($grant in $oauthGrants) {
+            $hasRiskyScope = ($grant.Scope -split " ") | Where-Object { $_ -in $highRiskScopes }
+            if (-not $hasRiskyScope) { continue }
+
+            try {
+                $sp = Get-MgServicePrincipal -ServicePrincipalId $grant.ClientId -ErrorAction SilentlyContinue
+                if ($sp -and $sp.AppOwnerOrganizationId) {
+                    # App de tenant externo com permissoes de alto risco
+                    $org = Get-MgOrganization -ErrorAction SilentlyContinue
+                    if ($sp.AppOwnerOrganizationId -ne $org.Id) {
+                        $record = [PSCustomObject]@{
+                            AppName            = $sp.DisplayName
+                            AppId              = $sp.AppId
+                            OwnerTenantId      = $sp.AppOwnerOrganizationId
+                            GrantedScopes      = $grant.Scope
+                            ConsentType        = $grant.ConsentType
+                        }
+                        $externalApps.Add($record)
+                        Write-IRLog "Consent Phishing: App externa '$($sp.DisplayName)' de tenant $($sp.AppOwnerOrganizationId) com scopes de alto risco [T1550.001]" `
+                            -Severity "HIGH" -MITRETechnique "T1550.001" -MITRETactic "Defense Evasion" -Data $record
+                    }
+                }
+            } catch { Write-DebugError "ImpersonationHunting" "SP lookup para $($grant.ClientId)" $_ }
+        }
+
+        if ($externalApps.Count -gt 0) {
+            Export-IRData -FileName "25_external_tenant_apps" -Data $externalApps
+        }
+
+    } catch {
+        Write-DebugError "ImpersonationHunting" "Erro no modulo" $_
+    }
+}
+
+# ============================================================
+# MODULO 26: CLOUD SERVICE ENUMERATION HUNTING (T1526)
+# ============================================================
+
+function Get-EnumerationHunting {
+    # T1526 - Cloud Service Discovery
+    # Detetar reconhecimento e enumeracao do tenant apos compromisso inicial
+    Write-Section "CLOUD ENUMERATION / RECONNAISSANCE HUNTING" "T1526/T1087" "Discovery"
+
+    if ($Script:SkipGraph) { Write-IRLog "Graph skipped" -Severity "INFO"; return }
+
+    try {
+        Write-Host "  >> A analisar padroes de enumeracao via Graph API..." -ForegroundColor Gray
+
+        # Analisar sign-ins de aplicacoes (nao interativos) com volume alto de operacoes
+        # Indicador de script/tool a enumerar o tenant
+        $filterDate = $Script:FilterDate
+
+        $appSignins = @(Get-MgAuditLogSignIn -Filter `
+            "createdDateTime ge $filterDate and isInteractive eq false" `
+            -Top 3000 -ErrorAction SilentlyContinue)
+
+        if ($appSignins.Count -gt 0) {
+            # Agrupar por app + IP - volume alto indica enumeracao
+            $enumCandidates = @($appSignins | Group-Object { "$($_.AppId)|$($_.IPAddress)" } |
+                Where-Object { $_.Count -gt 100 } |
+                Select-Object @{N="App";E={$_.Group[0].AppDisplayName}},
+                              @{N="AppId";E={$_.Group[0].AppId}},
+                              @{N="IP";E={$_.Group[0].IPAddress}},
+                              @{N="Country";E={$_.Group[0].Location.CountryOrRegion}},
+                              @{N="RequestCount";E={$_.Count}},
+                              @{N="UniqueUsers";E={($_.Group.UserPrincipalName | Sort-Object -Unique).Count}},
+                              @{N="FirstSeen";E={($_.Group.CreatedDateTime | Sort-Object)[0]}},
+                              @{N="LastSeen";E={($_.Group.CreatedDateTime | Sort-Object -Descending)[0]}})
+
+            foreach ($c in $enumCandidates) {
+                $sev = if ($c.RequestCount -gt 1000) { "HIGH" } else { "MEDIUM" }
+                Write-IRLog "Enumeracao suspeita: App '$($c.App)' de IP $($c.IP) -> $($c.RequestCount) chamadas non-interactive [T1526]" `
+                    -Severity $sev -MITRETechnique "T1526" -MITRETactic "Discovery" -Data $c
+            }
+
+            if ($enumCandidates.Count -gt 0) {
+                Export-IRData -FileName "26_enumeration_candidates" -Data $enumCandidates
+            }
+        }
+
+        # Verificar Service Principals com muitos app role assignments recentes
+        # Indicador: SP criado recentemente com muitas permissoes adicionadas rapidamente
+        Write-Host "  >> A verificar Service Principals com comportamento de enum..." -ForegroundColor Gray
+        $recentSPs = @(Get-MgServicePrincipal -Filter "createdDateTime ge $filterDate" `
+            -Property "Id,DisplayName,AppId,CreatedDateTime,AppOwnerOrganizationId" `
+            -ErrorAction SilentlyContinue)
+
+        $org = Get-MgOrganization -ErrorAction SilentlyContinue
+        $suspectSPs = @($recentSPs | Where-Object {
+            # SP externo (nao do proprio tenant)
+            $_.AppOwnerOrganizationId -and $_.AppOwnerOrganizationId -ne $org.Id
+        })
+
+        if ($suspectSPs.Count -gt 0) {
+            Write-IRLog "Service Principals externos criados recentemente: $($suspectSPs.Count) [T1526/T1098.003]" `
+                -Severity "MEDIUM" -MITRETechnique "T1526" -MITRETactic "Discovery"
+            Export-IRData -FileName "26_external_sp_recent" -Data ($suspectSPs | `
+                Select-Object DisplayName, AppId, CreatedDateTime, AppOwnerOrganizationId)
+        }
+
+        # Password Policy Discovery - verificar se alguma conta listou politicas de password
+        # Via Graph: leitura de /domains com authenticationType
+        Write-Host "  >> A verificar Password Policy Discovery..." -ForegroundColor Gray
+        $domains = @(Get-MgDomain -ErrorAction SilentlyContinue)
+        $passwordPolicyExposed = @($domains | Where-Object {
+            $_.PasswordNotificationWindowInDays -ne $null -or
+            $_.PasswordValidityPeriodInDays -ne $null
+        })
+
+        if ($passwordPolicyExposed.Count -gt 0) {
+            $policyData = $passwordPolicyExposed | Select-Object Id, AuthenticationType,
+                PasswordNotificationWindowInDays, PasswordValidityPeriodInDays
+
+            Write-IRLog "Password Policy exposta: $($passwordPolicyExposed.Count) dominios com politica visivel [T1201]" `
+                -Severity "LOW" -MITRETechnique "T1201" -MITRETactic "Discovery" -Data $policyData
+            Export-IRData -FileName "26_password_policy_exposure" -Data $policyData
+
+            # Verificar se a politica e fraca
+            foreach ($d in $passwordPolicyExposed) {
+                if ($d.PasswordValidityPeriodInDays -eq 2147483647) {
+                    Write-IRLog "Password sem expiracao configurada no dominio $($d.Id) [T1201]" `
+                        -Severity "MEDIUM" -MITRETechnique "T1201" -MITRETactic "Discovery"
+                }
+            }
+        }
+
+        # Verificar grupos com membros suspeitos (enum de grupos privilegiados)
+        Write-Host "  >> A verificar grupos criticos e membros suspeitos..." -ForegroundColor Gray
+        $criticalGroups = @(Get-MgGroup -Filter `
+            "startsWith(displayName,'Admin') or startsWith(displayName,'Security') or startsWith(displayName,'Global')" `
+            -Property "Id,DisplayName,CreatedDateTime,GroupTypes,MembershipRule" `
+            -Top 20 -ErrorAction SilentlyContinue)
+
+        if ($criticalGroups.Count -gt 0) {
+            $groupReport = [System.Collections.Generic.List[PSObject]]::new()
+            foreach ($grp in $criticalGroups) {
+                try {
+                    $members = @(Get-MgGroupMember -GroupId $grp.Id -Top 50 -ErrorAction SilentlyContinue)
+                    $guestMembers = @($members | Where-Object {
+                        $_.AdditionalProperties["userType"] -eq "Guest"
+                    })
+                    $record = [PSCustomObject]@{
+                        GroupName    = $grp.DisplayName
+                        TotalMembers = $members.Count
+                        GuestMembers = $guestMembers.Count
+                        CreatedDate  = $grp.CreatedDateTime
+                    }
+                    $groupReport.Add($record)
+                    if ($guestMembers.Count -gt 0) {
+                        Write-IRLog "Grupo critico '$($grp.DisplayName)' tem $($guestMembers.Count) guest(s) como membro [T1069.002]" `
+                            -Severity "HIGH" -MITRETechnique "T1069.002" -MITRETactic "Discovery" -Data $record
+                    }
+                } catch { Write-DebugError "EnumerationHunting" "Group members $($grp.DisplayName)" $_ }
+            }
+            Export-IRData -FileName "26_critical_groups" -Data $groupReport
+        }
+
+    } catch {
+        Write-DebugError "EnumerationHunting" "Erro no modulo" $_
+    }
+}
+
 function Build-AttackTimeline {
     # Correlacao cruzada de todos os findings para reconstruir cadeia de ataque
     Write-Section "ATTACK TIMELINE RECONSTRUCTION" "CORRELATION" "All Tactics"
@@ -3277,100 +3640,228 @@ function Get-FederationAndExternalIdentityAudit {
 # ============================================================
 
 function Get-EmailThreatAnalysis {
-    # T1566 - Phishing | T1656 - Impersonation | T1672 - Email Spoofing
-    Write-Section "EMAIL THREAT ANALYSIS" "T1566/T1656/T1672" "Initial Access / Defense Evasion"
+    Write-Section "EMAIL SECURITY - DMARC/SPF/DKIM & THREAT ANALYSIS" "T1566/T1566.002" "Initial Access / Defense Evasion"
 
-    if ($Script:SkipExchange) { Write-IRLog "Exchange skipped" -Severity "INFO"; return }
+    $emailReport    = [System.Collections.Generic.List[PSObject]]::new()
+    $allRiskFactors = [System.Collections.Generic.List[PSObject]]::new()
+    $domainScores   = @{}
 
+    # ---- Obter dominios do tenant ----
+    $domains = @()
     try {
-        # Anti-Phishing policies
-        Write-Host "  >> Verificando Anti-Phishing policies..." -ForegroundColor Gray
+        $domains = @(Get-MgDomain -ErrorAction Stop)
+        Write-Host "  >> A analisar $($domains.Count) dominios via DNS..." -ForegroundColor Gray
+    } catch {
+        Write-DebugError "EmailThreatAnalysis" "Get-MgDomain falhou" $_
+        return
+    }
+
+    foreach ($domain in $domains) {
+        $dom         = $domain.Id
+        $isDefault   = $domain.IsDefault
+        $isVerified  = $domain.IsVerified
+        $domFactors  = [System.Collections.Generic.List[PSObject]]::new()
+
+        Write-Host "  [*] $dom" -ForegroundColor DarkGray
+
+        $spfValid = $false; $spfRaw   = ""
+        $dmarcValid = $false; $dmarcRaw = ""; $dmarcPolicy = "none"
+        $dkimStatus = "N/A"
+
+        # --- SPF ---
         try {
-            $antiPhish = Get-AntiPhishPolicy -ErrorAction SilentlyContinue
-            $defaultPolicy = $antiPhish | Where-Object { $_.IsDefault -eq $true }
-
-            if ($defaultPolicy) {
-                $issues = @()
-                if ($defaultPolicy.Enabled -eq $false)                          { $issues += "Policy DESATIVADA" }
-                if ($defaultPolicy.EnableMailboxIntelligence -eq $false)        { $issues += "Mailbox Intelligence OFF" }
-                if ($defaultPolicy.EnableSpoofIntelligence -eq $false)          { $issues += "Spoof Intelligence OFF" }
-                if ($defaultPolicy.EnableUnauthenticatedSender -eq $false)      { $issues += "Unauth Sender indicator OFF" }
-                if ($defaultPolicy.PhishThresholdLevel -lt 2)                   { $issues += "Phish Threshold demasiado baixo" }
-
-                if ($issues.Count -gt 0) {
-                    Write-IRLog "Anti-Phishing gaps: $($issues -join ' | ') [T1566]" `
-                        -Severity "HIGH" -MITRETechnique "T1566" -MITRETactic "Initial Access"
+            $spfResult = Resolve-DnsName -Name $dom -Type TXT -ErrorAction Stop
+            $spfTxt    = $spfResult | Where-Object { $_.Strings -match "v=spf1" } | Select-Object -First 1
+            if ($spfTxt) {
+                $spfRaw   = ($spfTxt.Strings -join "") -replace "\s+"," "
+                $spfValid = $true
+                if ($spfRaw -match "\+all") {
+                    $domFactors.Add([PSCustomObject]@{Factor="SPF '+all' (aceita tudo)";RiskScore=30;Severity="CRITICAL";Recommendation="Alterar para -all imediatamente"})
+                    Write-IRLog "SPF '$dom' usa +all - qualquer servidor pode enviar email (+30 pts)" -Severity "CRITICAL" -MITRETechnique "T1566.002" -MITRETactic "Defense Evasion"
+                } elseif ($spfRaw -match "~all") {
+                    $domFactors.Add([PSCustomObject]@{Factor="SPF softfail (~all)";RiskScore=10;Severity="MEDIUM";Recommendation="Alterar para -all"})
+                    Write-IRLog "SPF '$dom': ~all (softfail - nao rejeita emails invalidos) (+10 pts)" -Severity "MEDIUM" -MITRETechnique "T1566.002" -MITRETactic "Defense Evasion"
+                } elseif ($spfRaw -match "\-all") {
+                    Write-IRLog "SPF '$dom': -all (strictfail) - configuracao segura" -Severity "INFO"
+                } elseif ($spfRaw -notmatch "all") {
+                    $domFactors.Add([PSCustomObject]@{Factor="SPF sem directiva 'all'";RiskScore=20;Severity="HIGH";Recommendation="Adicionar -all ao final do SPF"})
+                    Write-IRLog "SPF '$dom' sem directiva 'all' (+20 pts)" -Severity "HIGH" -MITRETechnique "T1566.002" -MITRETactic "Defense Evasion"
                 }
-                Export-IRData -FileName "23_anti_phish_policy" -Data ($antiPhish | Select-Object Name, Enabled, EnableMailboxIntelligence, EnableSpoofIntelligence, PhishThresholdLevel, EnableTargetedUserProtection)
+                $lookups = ([regex]::Matches($spfRaw,"include:|redirect=|a:|mx:") | Measure-Object).Count
+                if ($lookups -gt 8) {
+                    $domFactors.Add([PSCustomObject]@{Factor="SPF com $lookups lookups DNS (limite: 10)";RiskScore=15;Severity="MEDIUM";Recommendation="Simplificar SPF para <10 lookups"})
+                }
+            } else {
+                $domFactors.Add([PSCustomObject]@{Factor="SPF em falta";RiskScore=25;Severity="HIGH";Recommendation="Criar: v=spf1 include:spf.protection.outlook.com -all"})
+                Write-IRLog "SPF em falta para '$dom' (+25 pts)" -Severity "HIGH" -MITRETechnique "T1566.002" -MITRETactic "Defense Evasion"
             }
-        } catch { Write-IRLog "Anti-Phish: permissoes ou MDO nao disponivel" -Severity "INFO" }
-
-        # Safe Links / Safe Attachments
-        Write-Host "  >> Verificando Safe Links e Safe Attachments..." -ForegroundColor Gray
-        try {
-            $safeLinks = Get-SafeLinksPolicy -ErrorAction SilentlyContinue
-            $safeAttach = Get-SafeAttachmentPolicy -ErrorAction SilentlyContinue
-
-            $slDisabled = $safeLinks | Where-Object { $_.IsEnabled -eq $false -or $_.EnableSafeLinksForOffice -eq $false }
-            $saDisabled = $safeAttach | Where-Object { $_.Enable -eq $false }
-
-            if ($slDisabled.Count -gt 0) {
-                Write-IRLog "Safe Links DESATIVADO em $($slDisabled.Count) policies [T1566]" `
-                    -Severity "HIGH" -MITRETechnique "T1566" -MITRETactic "Initial Access"
-            }
-            if ($saDisabled.Count -gt 0) {
-                Write-IRLog "Safe Attachments DESATIVADO em $($saDisabled.Count) policies [T1566]" `
-                    -Severity "HIGH" -MITRETechnique "T1566" -MITRETactic "Initial Access"
-            }
-
-            Export-IRData -FileName "23_safe_links_policies" -Data ($safeLinks | Select-Object Name, IsEnabled, EnableSafeLinksForOffice, TrackClicks, AllowClickThrough)
-            Export-IRData -FileName "23_safe_attachments_policies" -Data ($safeAttach | Select-Object Name, Enable, Action, QuarantineTag)
-        } catch { Write-IRLog "Safe Links/Attachments: MDO P1 requerido" -Severity "INFO" }
-
-        # Quarantine - mensagens libertadas recentemente (indicador de tampering)
-        Write-Host "  >> Verificando releases de quarentena recentes..." -ForegroundColor Gray
-        if (-not $Script:SkipUAL) {
-            $quarantineReleases = Invoke-UALSearch `
-                -StartDate $Script:StartDate -EndDate $Script:EndDate `
-                -Operations @("QuarantineReleaseMessage","QuarantineRelease") `
-                -ResultSize 500 -ErrorAction SilentlyContinue
-
-            if ($quarantineReleases.Count -gt 0) {
-                Write-IRLog "Mensagens libertadas de quarentena: $($quarantineReleases.Count) - verificar se legitimas [T1566]" `
-                    -Severity "MEDIUM" -MITRETechnique "T1566" -MITRETactic "Initial Access"
-                Export-IRData -FileName "23_quarantine_releases" -Data ($quarantineReleases | Select-Object CreationDate, UserIds, Operations, AuditData)
-            }
+        } catch {
+            $domFactors.Add([PSCustomObject]@{Factor="SPF DNS lookup falhou";RiskScore=10;Severity="MEDIUM";Recommendation="Verificar DNS do dominio"})
+            Write-DebugError "EmailThreatAnalysis" "SPF DNS $dom" $_
         }
 
-        # DMARC / DKIM / SPF por dominio
-        Write-Host "  >> Verificando DMARC/DKIM/SPF configs..." -ForegroundColor Gray
+        # --- DMARC ---
         try {
-            $acceptedDomains = Get-AcceptedDomain -ErrorAction SilentlyContinue
-            $dkimConfigs     = Get-DkimSigningConfig -ErrorAction SilentlyContinue
-
-            $emailSecReport = $acceptedDomains | ForEach-Object {
-                $domain   = $_.DomainName
-                $dkimConf = $dkimConfigs | Where-Object { $_.Domain -eq $domain }
-                [PSCustomObject]@{
-                    Domain      = $domain
-                    DomainType  = $_.DomainType
-                    DKIMEnabled = if ($dkimConf) { $dkimConf.Enabled } else { "Not Configured" }
-                    DKIMStatus  = if ($dkimConf) { $dkimConf.Status } else { "N/A" }
+            $dmarcResult = Resolve-DnsName -Name "_dmarc.$dom" -Type TXT -ErrorAction Stop
+            $dmarcTxt    = $dmarcResult | Where-Object { $_.Strings -match "v=DMARC1" } | Select-Object -First 1
+            if ($dmarcTxt) {
+                $dmarcRaw   = ($dmarcTxt.Strings -join "") -replace "\s+"," "
+                $dmarcValid = $true
+                $pMatch     = [regex]::Match($dmarcRaw, "p=(\w+)")
+                if ($pMatch.Success) { $dmarcPolicy = $pMatch.Groups[1].Value }
+                switch ($dmarcPolicy) {
+                    "none" {
+                        $domFactors.Add([PSCustomObject]@{Factor="DMARC policy=none (so monitoriza)";RiskScore=20;Severity="HIGH";Recommendation="Alterar para p=quarantine depois p=reject"})
+                        Write-IRLog "DMARC '$dom': policy=none - nao rejeita emails falsos (+20 pts)" -Severity "HIGH" -MITRETechnique "T1566.002" -MITRETactic "Defense Evasion"
+                    }
+                    "quarantine" {
+                        $domFactors.Add([PSCustomObject]@{Factor="DMARC policy=quarantine (recomendado: reject)";RiskScore=5;Severity="LOW";Recommendation="Alterar para p=reject"})
+                        Write-IRLog "DMARC '$dom': policy=quarantine - bom, considerar reject" -Severity "LOW"
+                    }
+                    "reject" { Write-IRLog "DMARC '$dom': policy=reject - configuracao otima" -Severity "INFO" }
                 }
+                if ($dmarcRaw -notmatch "rua=") {
+                    $domFactors.Add([PSCustomObject]@{Factor="DMARC sem reporting URI (rua=)";RiskScore=5;Severity="LOW";Recommendation="Adicionar rua=mailto:dmarc-reports@$dom"})
+                }
+                $pctMatch = [regex]::Match($dmarcRaw, "pct=(\d+)")
+                if ($pctMatch.Success -and [int]$pctMatch.Groups[1].Value -lt 100) {
+                    $domFactors.Add([PSCustomObject]@{Factor="DMARC pct=$($pctMatch.Groups[1].Value) (nao 100%)";RiskScore=10;Severity="MEDIUM";Recommendation="Aumentar para pct=100"})
+                    Write-IRLog "DMARC '$dom' pct=$($pctMatch.Groups[1].Value) (+10 pts)" -Severity "MEDIUM" -MITRETechnique "T1566.002" -MITRETactic "Defense Evasion"
+                }
+            } else {
+                $domFactors.Add([PSCustomObject]@{Factor="DMARC em falta";RiskScore=30;Severity="HIGH";Recommendation="Criar: _dmarc.$dom TXT v=DMARC1; p=quarantine; rua=mailto:dmarc@$dom"})
+                Write-IRLog "DMARC nao configurado para '$dom' (+30 pts)" -Severity "HIGH" -MITRETechnique "T1566.002" -MITRETactic "Defense Evasion"
             }
-            Export-IRData -FileName "23_email_security_config" -Data $emailSecReport
+        } catch {
+            $domFactors.Add([PSCustomObject]@{Factor="DMARC nao encontrado";RiskScore=30;Severity="HIGH";Recommendation="Criar registo _dmarc.$dom TXT com v=DMARC1; p=reject"})
+            Write-IRLog "DMARC nao configurado para '$dom' (+30 pts)" -Severity "HIGH" -MITRETechnique "T1566.002" -MITRETactic "Defense Evasion"
+        }
 
-            $dkimOff = $emailSecReport | Where-Object { $_.DKIMEnabled -eq $false }
-            if ($dkimOff.Count -gt 0) {
-                Write-IRLog "DKIM desativado para: $($dkimOff.Domain -join ', ') - risco de spoofing [T1672]" `
-                    -Severity "HIGH" -MITRETechnique "T1672" -MITRETactic "Defense Evasion"
+        # --- DKIM ---
+        if (Test-EXOAvailable) {
+            try {
+                $dkimConf = Get-DkimSigningConfig -Identity $dom -ErrorAction SilentlyContinue
+                if ($dkimConf) {
+                    $dkimStatus = if ($dkimConf.Enabled) { "Enabled (EXO)" } else { "Disabled (EXO)" }
+                    if (-not $dkimConf.Enabled) {
+                        $domFactors.Add([PSCustomObject]@{Factor="DKIM desativado no EXO";RiskScore=25;Severity="HIGH";Recommendation="Enable-DkimSigningConfig -Identity $dom"})
+                        Write-IRLog "DKIM desativado para '$dom' via EXO (+25 pts)" -Severity "HIGH" -MITRETechnique "T1566.002" -MITRETactic "Defense Evasion"
+                    } else { Write-IRLog "DKIM '$dom': Enabled via EXO" -Severity "INFO" }
+                } else {
+                    $domFactors.Add([PSCustomObject]@{Factor="DKIM nao configurado no EXO";RiskScore=25;Severity="HIGH";Recommendation="New-DkimSigningConfig -DomainName $dom -Enabled `$true"})
+                }
+            } catch { Write-DebugError "EmailThreatAnalysis" "DKIM EXO $dom" $_ }
+        } else {
+            $dkimFound = $false
+            foreach ($sel in @("selector1","selector2")) {
+                try {
+                    if (Resolve-DnsName -Name "$sel._domainkey.$dom" -Type CNAME -ErrorAction Stop) {
+                        $dkimFound = $true; $dkimStatus = "Enabled (DNS: $sel)"
+                    }
+                } catch { }
             }
-        } catch { Write-IRLog "DMARC/DKIM check: $_" -Severity "INFO" }
+            if (-not $dkimFound) {
+                try {
+                    if (Resolve-DnsName -Name "selector1._domainkey.$dom" -Type TXT -ErrorAction Stop) {
+                        $dkimFound = $true; $dkimStatus = "Enabled (TXT)"
+                    }
+                } catch { }
+            }
+            if (-not $dkimFound) {
+                $dkimStatus = "Not Found (DNS)"
+                $domFactors.Add([PSCustomObject]@{Factor="DKIM nao encontrado via DNS";RiskScore=20;Severity="HIGH";Recommendation="Configurar DKIM no M365 Admin > Security > Email Auth"})
+                Write-IRLog "DKIM nao encontrado via DNS para '$dom' (+20 pts)" -Severity "HIGH" -MITRETechnique "T1566.002" -MITRETactic "Defense Evasion"
+            } else { Write-IRLog "DKIM '$dom': $dkimStatus" -Severity "INFO" }
+        }
 
-    } catch {
-        Write-IRLog "Erro Email Threat Analysis: $_" -Severity "INFO"
+        # --- Score por dominio ---
+        if ($domFactors.Count -gt 0) {
+            $domMeasure = $domFactors | Measure-Object -Property RiskScore -Sum
+            $domScore   = if ($domMeasure -and $domMeasure.Sum) { $domMeasure.Sum } else { 0 }
+        } else { $domScore = 0 }
+
+        if     ($domScore -ge 60) { $domLevel = "CRITICAL" }
+        elseif ($domScore -ge 35) { $domLevel = "HIGH"     }
+        elseif ($domScore -ge 15) { $domLevel = "MEDIUM"   }
+        elseif ($domScore -ge 5 ) { $domLevel = "LOW"      }
+        else                      { $domLevel = "OK"       }
+
+        $domainScores[$dom] = $domScore
+
+        # Adicionar factores deste dominio ao acumulador global
+        foreach ($f in $domFactors) { $allRiskFactors.Add($f) }
+
+        # Finding por dominio (apenas se tem problemas)
+        if ($domScore -gt 0) {
+            $domProblems = ($domFactors | ForEach-Object { $_.Factor }) -join "; "
+            $sevForDom   = if ($domLevel -eq "OK") { "INFO" } else { $domLevel }
+            Write-IRLog "Email Security '$dom': $domLevel (score $domScore) - $domProblems" `
+                -Severity $sevForDom -MITRETechnique "T1566.002" -MITRETactic "Defense Evasion" `
+                -Data ($domFactors | Select-Object Factor, RiskScore, Severity, Recommendation)
+        }
+
+        $emailReport.Add([PSCustomObject]@{
+            Domain       = $dom
+            IsDefault    = $isDefault
+            IsVerified   = $isVerified
+            SPF_Valid    = $spfValid
+            SPF_Record   = $spfRaw
+            DMARC_Valid  = $dmarcValid
+            DMARC_Policy = $dmarcPolicy
+            DMARC_Record = $dmarcRaw
+            DKIM_Status  = $dkimStatus
+            DomainScore  = $domScore
+            DomainLevel  = $domLevel
+        })
+
+        # Banner por dominio
+        if ($domLevel -eq "OK") {
+            Write-Host "    Score: 0 - Configuracao segura" -ForegroundColor Green
+        } else {
+            if ($domLevel -eq "CRITICAL") { $dc = "Red" } elseif ($domLevel -eq "HIGH") { $dc = "DarkYellow" } else { $dc = "Yellow" }
+            Write-Host "    Score: $domScore pts - $domLevel" -ForegroundColor $dc
+        }
     }
+
+    # --- Sumario global ---
+    if ($allRiskFactors.Count -gt 0) {
+        $totalMeasure = $allRiskFactors | Measure-Object -Property RiskScore -Sum
+        $totalRisk    = if ($totalMeasure -and $totalMeasure.Sum) { $totalMeasure.Sum } else { 0 }
+    } else { $totalRisk = 0 }
+
+    $worstDomain = $domainScores.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1
+    $secureDomains= @($domainScores.GetEnumerator() | Where-Object { $_.Value -eq 0 }).Count
+    $riskyDomains = @($domainScores.GetEnumerator() | Where-Object { $_.Value -gt 0 }).Count
+
+    if     ($totalRisk -ge 80) { $globalLevel = "CRITICAL" }
+    elseif ($totalRisk -ge 50) { $globalLevel = "HIGH"     }
+    elseif ($totalRisk -ge 25) { $globalLevel = "MEDIUM"   }
+    elseif ($totalRisk -ge 10) { $globalLevel = "LOW"      }
+    else                       { $globalLevel = "MINIMAL"  }
+
+    if ($globalLevel -eq "CRITICAL") { $gColor = "Red" } elseif ($globalLevel -eq "HIGH") { $gColor = "DarkYellow" } else { $gColor = "Yellow" }
+
+    Write-Host ""
+    Write-Host "  +==============================================+" -ForegroundColor $gColor
+    Write-Host "  |  EMAIL SECURITY RISK ASSESSMENT             |" -ForegroundColor White
+    Write-Host "  |  Nivel global : $($globalLevel.PadRight(31))|" -ForegroundColor $gColor
+    Write-Host "  |  Score total  : $("$totalRisk pts".PadRight(31))|" -ForegroundColor White
+    Write-Host "  |  Dominios OK  : $("$secureDomains/$($domains.Count)".PadRight(31))|" -ForegroundColor Green
+    if ($worstDomain) {
+        Write-Host "  |  Pior dominio : $("$($worstDomain.Key) ($($worstDomain.Value) pts)".Substring(0,[math]::Min("$($worstDomain.Key) ($($worstDomain.Value) pts)".Length,31)).PadRight(31))|" -ForegroundColor $gColor
+    }
+    Write-Host "  +==============================================+" -ForegroundColor $gColor
+    Write-Host ""
+
+    $sevLog = if ($globalLevel -eq "MINIMAL") { "INFO" } else { $globalLevel }
+    Write-IRLog "Email Security Global: $globalLevel (score $totalRisk, $riskyDomains/$($domains.Count) dominios com problemas)" `
+        -Severity $sevLog -MITRETechnique "T1566.002" -MITRETactic "Defense Evasion"
+
+    Export-IRData -FileName "23_email_security_report" -Data $emailReport
+    Export-IRData -FileName "23_email_risk_factors"    -Data $allRiskFactors
 }
+
+
 
 # ============================================================
 # ATUALIZAR FUNCAO PRINCIPAL COM NOVOS MODULOS
@@ -3394,7 +3885,9 @@ function Start-O365IRScriptFull {
         "Get-TeamsSuspiciousActivity","Get-ImpactIndicators","Get-DefenseEvasionIndicators",
         "Get-ConditionalAccessGapAnalysis","Get-DefenderAlerts","Get-PrivilegedIdentityDeepDive",
         "Get-ExfiltrationCorrelation","Get-NamedLocationsAndIPAnalysis","Get-DeviceAnomalies",
-        "Get-FederationAndExternalIdentityAudit","Get-EmailThreatAnalysis","Build-AttackTimeline"
+        "Get-FederationAndExternalIdentityAudit","Get-EmailThreatAnalysis",
+        "Get-MFAFatigueHunting","Get-ImpersonationHunting","Get-EnumerationHunting",
+        "Build-AttackTimeline"
     )
     foreach ($mod in $Script:_modules) {
         Start-ModuleTimer $mod
@@ -3435,6 +3928,9 @@ function Start-O365IRScriptFull {
     }
 
     Write-Host ""
+    # Fechar sessoes
+    Close-IRSessions
+
     Write-Host "  CSVs gerados:" -ForegroundColor Gray
     Get-ChildItem -Path $Script:OutputPath -File -Filter "*.csv" | Sort-Object Name | ForEach-Object {
         $size = [math]::Round($_.Length / 1KB, 1)
