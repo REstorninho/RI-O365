@@ -1,6 +1,6 @@
 # IR-O365 — Office 365 Incident Response Script
 
-**Versão actual: 5.1.0**  
+**Versão actual: 5.2.0**  
 Ferramenta de Incident Response para Microsoft 365 / Entra ID, mapeada contra a matriz [MITRE ATT&CK Enterprise — Office Suite Platform v18](https://attack.mitre.org/matrices/enterprise/cloud/officesuite/).
 
 ---
@@ -230,6 +230,7 @@ Cada execução começa com `Disconnect-MgGraph` + `Disconnect-ExchangeOnline` a
 
 | Versão | Alterações principais |
 |---|---|
+| 5.2.0 | Novo helper `Invoke-IRParallelForEach`: paraleliza (PS7+, `ForEach-Object -Parallel`, fallback sequencial em PS5.1) o loop de verificação de MFA por admin no módulo 03 (até 3 chamadas Graph por utilizador) - reduz significativamente o tempo deste módulo em tenants com muitos admins, sem alterar findings/CSV gerados |
 | 5.1.0 | Novo módulo 25 `Get-MailboxAccessForensics` (T1114.002, T1213) - correlaciona eventos `MailItemsAccessed`/`Send`/`SearchQueryInitiated` do Advanced Audit (requer E5) para utilizadores já marcados como CRITICAL/HIGH ou em watchlist, identificando acesso a mailbox, envio por terceiros (SendAs/SendOnBehalf) e pesquisas suspeitas pós-compromisso; novo helper `Get-JsonProperty` para acesso seguro a propriedades JSON variáveis sob StrictMode |
 | 5.0.1 | Fix `.Count` em `$null` (Where-Object sem matches) em vários módulos - causava abort total do `Build-AttackTimeline` e de secções de Defender Alerts, OAuth Apps, Transport Rules, Send-As, Named Locations e Device Anomalies sob StrictMode; fix precedência `-and`/`-or` no gap de Legacy Auth CA; fix `continue` dentro de `ForEach-Object` (BUG_FOREACHOBJ_CONTINUE) |
 | 4.9.2 | Fix `Measure-Object .Sum` em colecção vazia (PS5.1 StrictMode) |

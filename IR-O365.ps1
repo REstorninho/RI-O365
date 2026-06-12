@@ -112,7 +112,7 @@ foreach ($gmod in $Script:GraphSubModules) {
 # CONFIGURACAO & INICIALIZACAO
 # ============================================================
 
-$Script:Version         = "5.1.0"
+$Script:Version         = "5.2.0"
 $Script:TenantName      = "Unknown"
 $Script:TenantId        = "Unknown"
 $Script:OutputPath      = $Script:OutputPath
@@ -277,6 +277,34 @@ function Get-JsonProperty {
     if ($null -eq $Object) { return $Default }
     $prop = $Object.PSObject.Properties[$Name]
     if ($prop) { return $prop.Value } else { return $Default }
+}
+
+# FIX BUG_PARALLEL_GRAPH: paraleliza loops de leitura Microsoft Graph (1 chamada por
+# item) em PS7+ via 'ForEach-Object -Parallel'. O contexto de autenticacao do SDK
+# Microsoft.Graph (GraphSession) e' estado estatico partilhado pelo processo, por isso
+# os runspaces paralelos reutilizam a sessao ja autenticada pelo Connect-MgGraph inicial
+# - nao e' necessario reconectar. Em PS5.1 (ou se -Parallel falhar) cai para sequencial.
+#
+# IMPORTANTE: $ScriptBlock deve ser SOMENTE LEITURA (chamadas Get-Mg*) e devolver
+# objetos simples. NUNCA chamar Write-IRLog/Write-DebugError ou modificar $Script:*
+# dentro do ScriptBlock - estado partilhado (listas, contadores) nao e' thread-safe.
+# O caller deve processar os resultados devolvidos sequencialmente.
+function Invoke-IRParallelForEach {
+    param(
+        [Parameter(Mandatory)] [array]$InputObject,
+        [Parameter(Mandatory)] [scriptblock]$ScriptBlock,
+        [int]$ThrottleLimit = 5
+    )
+    if (-not $InputObject -or $InputObject.Count -eq 0) { return @() }
+
+    if ($PSVersionTable.PSVersion.Major -ge 7 -and $InputObject.Count -gt 1) {
+        try {
+            return @($InputObject | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel $ScriptBlock)
+        } catch {
+            Write-DebugError "Parallel" "ForEach-Object -Parallel falhou, a usar modo sequencial" $_
+        }
+    }
+    return @($InputObject | ForEach-Object -Process $ScriptBlock)
 }
 
 # FIX BUG_UAL_NULL: Invoke-UALSearch retorna $null (nao array vazio)
@@ -820,6 +848,8 @@ function Get-MFAStatus {
         
         $adminsMFAResults = [System.Collections.Generic.List[PSObject]]::new()
 
+        # Recolher membros de todas as roles privilegiadas (1 chamada Graph por role)
+        $memberTasks = [System.Collections.Generic.List[PSObject]]::new()
         foreach ($roleId in $privilegedRoles) {
             try {
                 $roleMembers = @()
@@ -840,83 +870,115 @@ function Get-MFAStatus {
 
                 foreach ($member in $roleMembers) {
                     if ($member.AdditionalProperties["@odata.type"] -ne "#microsoft.graph.user") { continue }
-                    $uid = $member.Id
-                    $upn = $member.AdditionalProperties["userPrincipalName"]
-
-                    # --- Metodo 1: Get-MgUserAuthenticationMethod (requer UserAuthenticationMethod.Read.All)
-                    $hasMFA    = $false
-                    $mfaMethods= @()
-                    $methodSrc = "N/A"
-                    try {
-                        $authMethods = @(Get-MgUserAuthenticationMethod -UserId $uid -ErrorAction Stop)
-                        $mfaTypes = @(
-                            "#microsoft.graph.microsoftAuthenticatorAuthenticationMethod",
-                            "#microsoft.graph.phoneAuthenticationMethod",
-                            "#microsoft.graph.fido2AuthenticationMethod",
-                            "#microsoft.graph.windowsHelloForBusinessAuthenticationMethod",
-                            "#microsoft.graph.softwareOathAuthenticationMethod",
-                            "#microsoft.graph.temporaryAccessPassAuthenticationMethod"
-                        )
-                        $mfaMethods = @($authMethods | Where-Object {
-                            $_.AdditionalProperties["@odata.type"] -in $mfaTypes
-                        })
-                        $hasMFA    = $mfaMethods.Count -gt 0
-                        $methodSrc = "AuthenticationMethod API"
-                        Write-DebugError "MFAStatus" "User $upn - $($authMethods.Count) methods found, $($mfaMethods.Count) MFA" $null
-                    } catch {
-                        Write-DebugError "MFAStatus" "AuthMethod API falhou para $upn" $_
-                    }
-
-                    # --- Metodo 2 (fallback): verificar via User StrongAuthenticationRequirements (MSOL-style via Graph)
-                    if (-not $hasMFA -and $methodSrc -eq "N/A") {
-                        try {
-                            $userDetail = Get-MgUser -UserId $uid `
-                                -Property "Id,UserPrincipalName,StrongAuthenticationDetail" `
-                                -ErrorAction SilentlyContinue
-                            if ($userDetail -and $userDetail.AdditionalProperties.ContainsKey("strongAuthenticationDetail")) {
-                                $sad = $userDetail.AdditionalProperties["strongAuthenticationDetail"]
-                                if ($sad -and $sad.methods -and $sad.methods.Count -gt 0) {
-                                    $hasMFA    = $true
-                                    $methodSrc = "StrongAuthDetail"
-                                }
-                            }
-                        } catch { Write-DebugError "MFAStatus" "StrongAuth check $upn" $_ }
-                    }
-
-                    # --- Metodo 3 (fallback): verificar via Reports API - per-user MFA state
-                    if (-not $hasMFA -and $methodSrc -eq "N/A") {
-                        try {
-                            $regDetail = Get-MgReportAuthenticationMethodUserRegistrationDetail `
-                                -UserRegistrationDetailsId $uid -ErrorAction Stop
-                            if ($regDetail) {
-                                $hasMFA    = $regDetail.IsMfaRegistered -or $regDetail.IsMfaCapable
-                                $methodSrc = "RegistrationDetail (isMfaRegistered=$($regDetail.IsMfaRegistered))"
-                            }
-                        } catch { Write-DebugError "MFAStatus" "RegistrationDetail $upn" $_ }
-                    }
-
-                    $record = [PSCustomObject]@{
-                        UserId        = $uid
-                        UPN           = $upn
-                        RoleId        = $roleId
-                        MFAConfigured = $hasMFA
-                        MethodCount   = $mfaMethods.Count
-                        DetectionSrc  = $methodSrc
-                    }
-                    $adminsMFAResults.Add($record)
-
-                    if (-not $hasMFA -and $methodSrc -ne "N/A") {
-                        # So reportar como sem MFA se conseguimos verificar E nao tem
-                        Write-IRLog "ADMIN SEM MFA VERIFICADO: $upn (via $methodSrc) [T1556.006]" `
-                            -Severity "CRITICAL" -MITRETechnique "T1556.006" -MITRETactic "Defense Evasion" -Data $record
-                    } elseif ($methodSrc -eq "N/A") {
-                        Write-IRLog "MFA nao verificavel para $upn - scope UserAuthenticationMethod.Read.All pode estar em falta" `
-                            -Severity "INFO"
-                    } else {
-                        Write-IRLog "Admin com MFA: $upn ($methodSrc)" -Severity "INFO"
-                    }
+                    $memberTasks.Add([PSCustomObject]@{
+                        UserId = $member.Id
+                        UPN    = $member.AdditionalProperties["userPrincipalName"]
+                        RoleId = $roleId
+                    })
                 }
             } catch { Write-DebugError "MFAStatus" "Role loop $roleId" $_ }
+        }
+
+        # FIX BUG_PARALLEL_MFA: verificacao de MFA por admin (1-3 chamadas Graph cada) e'
+        # o loop mais lento deste modulo. Em PS7+ corre em paralelo via
+        # Invoke-IRParallelForEach; o scriptblock e' so-leitura e devolve objetos que
+        # sao processados (logging, $Script:Findings) sequencialmente a seguir.
+        $mfaCheckScript = {
+            $task = $_
+            $mfaTypes = @(
+                "#microsoft.graph.microsoftAuthenticatorAuthenticationMethod",
+                "#microsoft.graph.phoneAuthenticationMethod",
+                "#microsoft.graph.fido2AuthenticationMethod",
+                "#microsoft.graph.windowsHelloForBusinessAuthenticationMethod",
+                "#microsoft.graph.softwareOathAuthenticationMethod",
+                "#microsoft.graph.temporaryAccessPassAuthenticationMethod"
+            )
+            Import-Module Microsoft.Graph.Identity.SignIns, Microsoft.Graph.Users, Microsoft.Graph.Reports -ErrorAction SilentlyContinue
+
+            $uid = $task.UserId
+            $upn = $task.UPN
+            $hasMFA     = $false
+            $mfaMethods = @()
+            $methodSrc  = "N/A"
+            $debugMsgs  = [System.Collections.Generic.List[string]]::new()
+
+            # --- Metodo 1: Get-MgUserAuthenticationMethod (requer UserAuthenticationMethod.Read.All)
+            try {
+                $authMethods = @(Get-MgUserAuthenticationMethod -UserId $uid -ErrorAction Stop)
+                $mfaMethods = @($authMethods | Where-Object {
+                    $_.AdditionalProperties["@odata.type"] -in $mfaTypes
+                })
+                $hasMFA    = $mfaMethods.Count -gt 0
+                $methodSrc = "AuthenticationMethod API"
+                $debugMsgs.Add("User $upn - $($authMethods.Count) methods found, $($mfaMethods.Count) MFA")
+            } catch {
+                $debugMsgs.Add("AuthMethod API falhou para $upn`: $($_.Exception.Message)")
+            }
+
+            # --- Metodo 2 (fallback): verificar via User StrongAuthenticationRequirements (MSOL-style via Graph)
+            if (-not $hasMFA -and $methodSrc -eq "N/A") {
+                try {
+                    $userDetail = Get-MgUser -UserId $uid `
+                        -Property "Id,UserPrincipalName,StrongAuthenticationDetail" `
+                        -ErrorAction SilentlyContinue
+                    if ($userDetail -and $userDetail.AdditionalProperties.ContainsKey("strongAuthenticationDetail")) {
+                        $sad = $userDetail.AdditionalProperties["strongAuthenticationDetail"]
+                        if ($sad -and $sad.methods -and $sad.methods.Count -gt 0) {
+                            $hasMFA    = $true
+                            $methodSrc = "StrongAuthDetail"
+                        }
+                    }
+                } catch { $debugMsgs.Add("StrongAuth check $upn`: $($_.Exception.Message)") }
+            }
+
+            # --- Metodo 3 (fallback): verificar via Reports API - per-user MFA state
+            if (-not $hasMFA -and $methodSrc -eq "N/A") {
+                try {
+                    $regDetail = Get-MgReportAuthenticationMethodUserRegistrationDetail `
+                        -UserRegistrationDetailsId $uid -ErrorAction Stop
+                    if ($regDetail) {
+                        $hasMFA    = $regDetail.IsMfaRegistered -or $regDetail.IsMfaCapable
+                        $methodSrc = "RegistrationDetail (isMfaRegistered=$($regDetail.IsMfaRegistered))"
+                    }
+                } catch { $debugMsgs.Add("RegistrationDetail $upn`: $($_.Exception.Message)") }
+            }
+
+            [PSCustomObject]@{
+                UserId        = $uid
+                UPN           = $upn
+                RoleId        = $task.RoleId
+                MFAConfigured = $hasMFA
+                MethodCount   = $mfaMethods.Count
+                DetectionSrc  = $methodSrc
+                DebugMsgs     = @($debugMsgs)
+            }
+        }
+
+        $mfaResultsRaw = Invoke-IRParallelForEach -InputObject @($memberTasks) -ScriptBlock $mfaCheckScript -ThrottleLimit 5
+
+        foreach ($result in $mfaResultsRaw) {
+            foreach ($dm in $result.DebugMsgs) { Write-DebugError "MFAStatus" $dm $null }
+
+            $record = [PSCustomObject]@{
+                UserId        = $result.UserId
+                UPN           = $result.UPN
+                RoleId        = $result.RoleId
+                MFAConfigured = $result.MFAConfigured
+                MethodCount   = $result.MethodCount
+                DetectionSrc  = $result.DetectionSrc
+            }
+            $adminsMFAResults.Add($record)
+
+            if (-not $result.MFAConfigured -and $result.DetectionSrc -ne "N/A") {
+                # So reportar como sem MFA se conseguimos verificar E nao tem
+                Write-IRLog "ADMIN SEM MFA VERIFICADO: $($result.UPN) (via $($result.DetectionSrc)) [T1556.006]" `
+                    -Severity "CRITICAL" -MITRETechnique "T1556.006" -MITRETactic "Defense Evasion" -Data $record
+            } elseif ($result.DetectionSrc -eq "N/A") {
+                Write-IRLog "MFA nao verificavel para $($result.UPN) - scope UserAuthenticationMethod.Read.All pode estar em falta" `
+                    -Severity "INFO"
+            } else {
+                Write-IRLog "Admin com MFA: $($result.UPN) ($($result.DetectionSrc))" -Severity "INFO"
+            }
         }
         Export-IRData -FileName "02_admin_mfa_status" -Data $adminsMFAResults
         
