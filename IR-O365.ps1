@@ -112,7 +112,7 @@ foreach ($gmod in $Script:GraphSubModules) {
 # CONFIGURACAO & INICIALIZACAO
 # ============================================================
 
-$Script:Version         = "5.3.0"
+$Script:Version         = "5.4.0"
 $Script:TenantName      = "Unknown"
 $Script:TenantId        = "Unknown"
 $Script:OutputPath      = $Script:OutputPath
@@ -1460,7 +1460,46 @@ function Get-SuspiciousOAuthApps {
             }
         }
         Export-IRData -FileName "05_apps_recent_credentials" -Data $appsWithRecentCreds
-        
+
+        # Credenciais adicionadas a service principals via UAL (T1098.001 - Additional Cloud
+        # Credentials). Complementa o check acima: cobre tambem SPs sem objeto Application
+        # local (apps multi-tenant consentidas noutro tenant) e identifica quem o fez (Actor).
+        Write-Host "  >> Verificando 'Add service principal credentials' no UAL..." -ForegroundColor Gray
+        if (-not $Script:SkipUAL) {
+            try {
+                $credEvents = Invoke-UALSearch `
+                    -StartDate $Script:StartDate -EndDate $Script:EndDate `
+                    -Operations @("Add service principal credentials.", "Add service principal credentials") `
+                    -RecordType "AzureActiveDirectory" -ResultSize 1000 -ErrorAction SilentlyContinue
+
+                $credResults = [System.Collections.Generic.List[PSObject]]::new()
+                foreach ($ev in $credEvents) {
+                    $audit = $null
+                    try { $audit = $ev.AuditData | ConvertFrom-Json } catch { continue }
+
+                    $actorEntry = @(Get-JsonProperty $audit "Actor" @()) | Select-Object -First 1
+                    $actorUpn   = if ($actorEntry) { Get-JsonProperty $actorEntry "ID" $ev.UserIds } else { $ev.UserIds }
+
+                    $targetEntry = @(Get-JsonProperty $audit "Target" @()) | Select-Object -First 1
+                    $spName      = if ($targetEntry) { Get-JsonProperty $targetEntry "ID" (Get-JsonProperty $audit "ObjectId" "desconhecido") } else { Get-JsonProperty $audit "ObjectId" "desconhecido" }
+
+                    $record = [PSCustomObject]@{
+                        Timestamp        = $ev.CreationDate
+                        Actor            = $actorUpn
+                        ServicePrincipal = $spName
+                    }
+                    $credResults.Add($record)
+
+                    Write-IRLog "Credenciais adicionadas a service principal '$spName' por $actorUpn [T1098.001]" `
+                        -Severity "HIGH" -MITRETechnique "T1098.001" -MITRETactic "Persistence" -Data $record
+                }
+
+                if ($credResults.Count -gt 0) {
+                    Export-IRData -FileName "05_sp_credentials_added_ual" -Data $credResults
+                }
+            } catch { Write-IRLog "Erro ao verificar Add service principal credentials (UAL): $_" -Severity "INFO" }
+        }
+
         # App Role Assignments perigosos
         Write-Host "  >> Verificando app role assignments elevados..." -ForegroundColor Gray
         $dangerousRoles = @(
@@ -2929,6 +2968,54 @@ function Get-ConditionalAccessGapAnalysis {
         Export-IRData -FileName "14_ca_gap_analysis" -Data $caDetail
 
         Write-IRLog "CA Gap Analysis: $($caPolicies.Count) policies analisadas" -Severity "INFO"
+
+        # Alteracoes a CA policies / Security Defaults no periodo (T1556.009 - Conditional
+        # Access Policies / T1562.008). Exclusoes adicionadas a uma policy sao a forma mais
+        # comum de um atacante "abrir uma porta" sem desativar a policy toda.
+        Write-Host "  >> Verificando alteracoes a CA policies (UAL)..." -ForegroundColor Gray
+        if (-not $Script:SkipUAL) {
+            try {
+                $caChangeEvents = Invoke-UALSearch `
+                    -StartDate $Script:StartDate -EndDate $Script:EndDate `
+                    -Operations @("Add Conditional Access policy", "Update Conditional Access policy", "Delete Conditional Access policy", "Update security defaults") `
+                    -RecordType "AzureActiveDirectory" -ResultSize 1000 -ErrorAction SilentlyContinue
+
+                $caChangeResults = [System.Collections.Generic.List[PSObject]]::new()
+                foreach ($ev in $caChangeEvents) {
+                    $audit = $null
+                    try { $audit = $ev.AuditData | ConvertFrom-Json } catch { continue }
+
+                    $actorEntry = @(Get-JsonProperty $audit "Actor" @()) | Select-Object -First 1
+                    $actorUpn   = if ($actorEntry) { Get-JsonProperty $actorEntry "ID" $ev.UserIds } else { $ev.UserIds }
+
+                    $targetEntry = @(Get-JsonProperty $audit "Target" @()) | Select-Object -First 1
+                    $policyName  = if ($targetEntry) { Get-JsonProperty $targetEntry "ID" "" } else { "" }
+
+                    $record = [PSCustomObject]@{
+                        Timestamp = $ev.CreationDate
+                        Operation = $ev.Operations
+                        Actor     = $actorUpn
+                        Policy    = $policyName
+                    }
+                    $caChangeResults.Add($record)
+
+                    if ($ev.Operations -eq "Delete Conditional Access policy") {
+                        Write-IRLog "CA policy ELIMINADA por $actorUpn : $policyName [T1562.008]" `
+                            -Severity "HIGH" -MITRETechnique "T1562.008" -MITRETactic "Defense Evasion" -Data $record
+                    } elseif ($ev.Operations -eq "Update security defaults") {
+                        Write-IRLog "Security Defaults alterado por $actorUpn [T1562.008]" `
+                            -Severity "HIGH" -MITRETechnique "T1562.008" -MITRETactic "Defense Evasion" -Data $record
+                    } else {
+                        Write-IRLog "CA policy alterada por $actorUpn : $policyName [T1556.009] - rever exclusoes de utilizadores/grupos" `
+                            -Severity "MEDIUM" -MITRETechnique "T1556.009" -MITRETactic "Defense Evasion" -Data $record
+                    }
+                }
+
+                if ($caChangeResults.Count -gt 0) {
+                    Export-IRData -FileName "14_ca_policy_changes" -Data $caChangeResults
+                }
+            } catch { Write-IRLog "Erro ao verificar alteracoes CA policies (UAL): $_" -Severity "INFO" }
+        }
 
     } catch {
         Write-IRLog "Erro CA Gap Analysis: $_" -Severity "INFO"
