@@ -112,7 +112,7 @@ foreach ($gmod in $Script:GraphSubModules) {
 # CONFIGURACAO & INICIALIZACAO
 # ============================================================
 
-$Script:Version         = "5.4.0"
+$Script:Version         = "5.5.0"
 $Script:TenantName      = "Unknown"
 $Script:TenantId        = "Unknown"
 $Script:OutputPath      = $Script:OutputPath
@@ -1592,7 +1592,10 @@ function Get-CriticalAuditEvents {
         @{ Ops = @("FileDownloaded","FileSyncDownloadedFull");                            Label = "Bulk_File_Downloads";        MITRE = "T1530";     Sev = "MEDIUM" },
         @{ Ops = @("AnonymousLinkCreated","SharingInvitationCreated");                    Label = "Anonymous_External_Sharing"; MITRE = "T1567";     Sev = "MEDIUM" },
         @{ Ops = @("ManagedSyncClientAllowed","AddedToSecureLink");                       Label = "SPO_Sync_Events";            MITRE = "T1213.002"; Sev = "INFO" },
-        @{ Ops = @("Set-MsolPasswordPolicy","Set-MsolDomainFederationSettings");          Label = "Auth_Policy_Changes";        MITRE = "T1556.007"; Sev = "CRITICAL" }
+        @{ Ops = @("Set-MsolPasswordPolicy","Set-MsolDomainFederationSettings");          Label = "Auth_Policy_Changes";        MITRE = "T1556.007"; Sev = "CRITICAL" },
+        @{ Ops = @("PurviewSearchExportJobSubmitted","ReviewSetExportJobSubmitted","SearchExported"); Label = "eDiscovery_Export_Jobs"; MITRE = "T1213"; Sev = "HIGH" },
+        @{ Ops = @("HoldCreated","HoldRemoved","CaseRemoved");                           Label = "eDiscovery_Case_Hold_Changes"; MITRE = "T1070"; Sev = "MEDIUM" },
+        @{ Ops = @("Add member to role completed (PIM activation)","Add member to role outside of PIM (permanent)"); Label = "PIM_Role_Activations"; MITRE = "T1098.003"; Sev = "MEDIUM" }
     )
     
     foreach ($query in $auditQueries) {
